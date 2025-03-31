@@ -4,7 +4,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
 use rhss::fs::FileSystem;
 use rhss::storage::{LocalStorage, HybridStorage};
-use rhss::fuse::FuseAdapter;
+use rhss::fuse::{FuseAdapter, FuseConfig};
 use tracing_subscriber::{fmt, EnvFilter};
 use tracing::{info, error};
 
@@ -61,6 +61,18 @@ fn main() {
         args.threshold,
     ));
 
+    // 创建 FUSE 配置
+    let config = FuseConfig::new()
+        .with_ignore_paths(vec![
+            ".DS_Store".to_string(),
+            ".hidden".to_string(),
+            ".git".to_string(),
+            "@executable_path".to_string(),
+        ])
+        .with_ignore_patterns(vec![
+            "._*".to_string(),  // macOS 元数据文件
+        ]);
+
     // 设置中断信号处理
     let running = Arc::new(AtomicBool::new(true));
     let r = running.clone();
@@ -74,7 +86,7 @@ fn main() {
     }).expect("无法设置中断处理器");
 
     // 创建并挂载 FUSE 文件系统
-    let adapter = FuseAdapter::new(fs);
+    let adapter = FuseAdapter::new(fs, config);
     
     // 在单独的线程中运行挂载
     let mount_point_for_mount = mount_point.clone();

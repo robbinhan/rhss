@@ -1,7 +1,7 @@
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use fuser::{
@@ -14,6 +14,72 @@ use tracing::{info, error, debug, warn};
 
 const TTL: Duration = Duration::from_secs(1);
 
+#[derive(Debug, Clone)]
+pub struct FuseConfig {
+    ignore_paths: HashSet<String>,
+    ignore_patterns: Vec<String>,
+}
+
+impl Default for FuseConfig {
+    fn default() -> Self {
+        let mut ignore_paths = HashSet::new();
+        ignore_paths.insert(".DS_Store".to_string());
+        ignore_paths.insert(".hidden".to_string());
+        ignore_paths.insert(".git".to_string());
+        ignore_paths.insert("@executable_path".to_string());
+
+        let ignore_patterns = vec![
+            "._*".to_string(),  // macOS 元数据文件
+        ];
+
+        Self {
+            ignore_paths,
+            ignore_patterns,
+        }
+    }
+}
+
+impl FuseConfig {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_ignore_paths(mut self, paths: Vec<String>) -> Self {
+        self.ignore_paths.extend(paths);
+        self
+    }
+
+    pub fn with_ignore_patterns(mut self, patterns: Vec<String>) -> Self {
+        self.ignore_patterns.extend(patterns);
+        self
+    }
+
+    pub fn should_ignore(&self, path: &Path) -> bool {
+        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            // 检查完全匹配
+            if self.ignore_paths.contains(name) {
+                return true;
+            }
+
+            // 检查模式匹配
+            for pattern in &self.ignore_patterns {
+                if pattern.ends_with('*') {
+                    let prefix = &pattern[..pattern.len() - 1];
+                    if name.starts_with(prefix) {
+                        return true;
+                    }
+                }
+            }
+
+            // 检查单个字母
+            if name.len() == 1 {
+                return true;
+            }
+        }
+        false
+    }
+}
+
 struct FuseState {
     fs: Box<dyn FileSystem>,
     path_to_ino: Mutex<HashMap<PathBuf, u64>>,
@@ -21,10 +87,11 @@ struct FuseState {
     next_ino: Mutex<u64>,
     next_fh: Mutex<u64>,
     fh_to_path: Mutex<HashMap<u64, PathBuf>>,
+    config: FuseConfig,
 }
 
 impl FuseState {
-    fn new(fs: Box<dyn FileSystem>) -> Self {
+    fn new(fs: Box<dyn FileSystem>, config: FuseConfig) -> Self {
         let mut path_to_ino = HashMap::new();
         let mut ino_to_path = HashMap::new();
         let root_path = PathBuf::from("");
@@ -38,6 +105,7 @@ impl FuseState {
             next_ino: Mutex::new(FUSE_ROOT_ID + 1),
             next_fh: Mutex::new(1),
             fh_to_path: Mutex::new(HashMap::new()),
+            config,
         }
     }
 
@@ -115,9 +183,9 @@ pub struct FuseAdapter {
 }
 
 impl FuseAdapter {
-    pub fn new(fs: Box<dyn FileSystem>) -> Self {
+    pub fn new(fs: Box<dyn FileSystem>, config: FuseConfig) -> Self {
         Self {
-            state: Arc::new(FuseState::new(fs)),
+            state: Arc::new(FuseState::new(fs, config)),
         }
     }
 
@@ -163,12 +231,8 @@ impl Filesystem for FuseAdapter {
                     reply.entry(&TTL, &attr, 0);
                 }
                 Err(e) => {
-                    if let Some(name_str) = path_clone.file_name().and_then(|n| n.to_str()) {
-                        if name_str.starts_with("._") {
-                            debug!("lookup: ignoring macOS metadata file: {:?}", path_clone);
-                        } else {
-                            error!("lookup error for path={:?}: {:?}", path_clone, e);
-                        }
+                    if state.config.should_ignore(&path_clone) {
+                        debug!("lookup: ignoring special path: {:?}", path_clone);
                     } else {
                         error!("lookup error for path={:?}: {:?}", path_clone, e);
                     }
