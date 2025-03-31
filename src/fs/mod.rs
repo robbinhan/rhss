@@ -1,7 +1,6 @@
 use std::path::Path;
 use async_trait::async_trait;
 use crate::error::Result;
-use crate::error::FsError;
 use crate::storage::Storage;
 
 #[derive(Debug, Clone)]

@@ -3,7 +3,6 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
-use tokio::runtime::Handle;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
     ReplyWrite, ReplyCreate, Request, FUSE_ROOT_ID,

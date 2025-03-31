@@ -2,7 +2,6 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use clap::Parser;
-use rhss::fs::FileSystem;
 use rhss::storage::{LocalStorage, HybridStorage};
 use rhss::fuse::{FuseAdapter, FuseConfig};
 use tracing_subscriber::{fmt, EnvFilter};
