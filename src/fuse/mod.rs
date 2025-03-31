@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use tokio::runtime::Handle;
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, Request, FUSE_ROOT_ID,
+    ReplyWrite, ReplyCreate, Request, FUSE_ROOT_ID,
 };
 use libc::{ENOENT, ENOSYS};
 use crate::fs::FileSystem;
@@ -19,13 +19,15 @@ struct FuseState {
     path_to_ino: Mutex<HashMap<PathBuf, u64>>,
     ino_to_path: Mutex<HashMap<u64, PathBuf>>,
     next_ino: Mutex<u64>,
+    next_fh: Mutex<u64>,
+    fh_to_path: Mutex<HashMap<u64, PathBuf>>,
 }
 
 impl FuseState {
     fn new(fs: Box<dyn FileSystem>) -> Self {
         let mut path_to_ino = HashMap::new();
         let mut ino_to_path = HashMap::new();
-        let root_path = PathBuf::from("/");
+        let root_path = PathBuf::from("");
         path_to_ino.insert(root_path.clone(), FUSE_ROOT_ID);
         ino_to_path.insert(FUSE_ROOT_ID, root_path);
 
@@ -34,6 +36,8 @@ impl FuseState {
             path_to_ino: Mutex::new(path_to_ino),
             ino_to_path: Mutex::new(ino_to_path),
             next_ino: Mutex::new(FUSE_ROOT_ID + 1),
+            next_fh: Mutex::new(1),
+            fh_to_path: Mutex::new(HashMap::new()),
         }
     }
 
@@ -84,6 +88,25 @@ impl FuseState {
         ino_to_path.insert(ino, path.clone());
         debug!("allocate_ino: new ino={} for path={:?}", ino, path);
         ino
+    }
+
+    fn allocate_fh(&self, path: PathBuf) -> u64 {
+        let mut next_fh = self.next_fh.lock().unwrap();
+        let mut fh_to_path = self.fh_to_path.lock().unwrap();
+        let fh = *next_fh;
+        *next_fh += 1;
+        fh_to_path.insert(fh, path);
+        fh
+    }
+
+    fn get_path_from_fh(&self, fh: u64) -> Option<PathBuf> {
+        let fh_to_path = self.fh_to_path.lock().unwrap();
+        fh_to_path.get(&fh).cloned()
+    }
+
+    fn release_fh(&self, fh: u64) {
+        let mut fh_to_path = self.fh_to_path.lock().unwrap();
+        fh_to_path.remove(&fh);
     }
 }
 
@@ -225,8 +248,8 @@ impl Filesystem for FuseAdapter {
     fn write(
         &mut self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         _offset: i64,
         data: &[u8],
         _write_flags: u32,
@@ -234,10 +257,10 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let path = match self.state.get_path(ino, None) {
+        let path = match self.state.get_path_from_fh(fh) {
             Some(p) => p,
             None => {
-                error!("write: failed to get path for ino={}", ino);
+                error!("write: failed to get path for fh={}", fh);
                 reply.error(ENOENT);
                 return;
             }
@@ -249,12 +272,12 @@ impl Filesystem for FuseAdapter {
         let _result = self.run_async(async move {
             match state.fs.write_file(&path_clone, &data).await {
                 Ok(()) => {
-                    debug!("write: success for path={:?}", path_clone);
+                    debug!("write: success for path={:?}, size={}", path_clone, data.len());
                     reply.written(data.len() as u32);
                 }
                 Err(e) => {
                     error!("write error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
+                    reply.error(ENOENT);
                 }
             }
         });
@@ -263,18 +286,18 @@ impl Filesystem for FuseAdapter {
     fn read(
         &mut self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
         size: u32,
         _flags: i32,
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = match self.state.get_path(ino, None) {
+        let path = match self.state.get_path_from_fh(fh) {
             Some(p) => p,
             None => {
-                error!("read: failed to get path for ino={}", ino);
+                error!("read: failed to get path for fh={}", fh);
                 reply.error(ENOENT);
                 return;
             }
@@ -427,5 +450,91 @@ impl Filesystem for FuseAdapter {
                 }
             }
         });
+    }
+
+    fn create(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        let path = match self.state.get_path(parent, Some(name)) {
+            Some(p) => p,
+            None => {
+                error!("create: failed to get path for parent={}, name={:?}", parent, name);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        debug!("create: {:?}, mode={:o}", path, mode);
+        let state = Arc::clone(&self.state);
+        let path_clone = path.clone();
+        let _result = self.run_async(async move {
+            match state.fs.create_file(&path_clone).await {
+                Ok(()) => {
+                    let ino = state.allocate_ino(path_clone.clone());
+                    let fh = state.allocate_fh(path_clone.clone());
+                    let attr = state.make_file_attr(ino, 0, mode, false);
+                    debug!("create: success for path={:?}, ino={}, fh={}", path_clone, ino, fh);
+                    reply.created(&TTL, &attr, 0, fh, 0);
+                }
+                Err(e) => {
+                    error!("create error for path={:?}: {:?}", path_clone, e);
+                    reply.error(ENOSYS);
+                }
+            }
+        });
+    }
+
+    fn open(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        _flags: i32,
+        reply: fuser::ReplyOpen,
+    ) {
+        let path = match self.state.get_path(_ino, None) {
+            Some(p) => p,
+            None => {
+                error!("open: failed to get path for ino={}", _ino);
+                reply.error(ENOENT);
+                return;
+            }
+        };
+        debug!("open: {:?}", path);
+        let state = Arc::clone(&self.state);
+        let path_clone = path.clone();
+        let _result = self.run_async(async move {
+            match state.fs.get_metadata(&path_clone).await {
+                Ok(_) => {
+                    let fh = state.allocate_fh(path_clone.clone());
+                    debug!("open: success for path={:?}, fh={}", path_clone, fh);
+                    reply.opened(fh, 0);  // flags=0
+                }
+                Err(e) => {
+                    error!("open error for path={:?}: {:?}", path_clone, e);
+                    reply.error(ENOENT);
+                }
+            }
+        });
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: fuser::ReplyEmpty,
+    ) {
+        debug!("release: fh={}", fh);
+        self.state.release_fh(fh);
+        reply.ok();
     }
 } 

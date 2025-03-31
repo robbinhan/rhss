@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use std::os::unix::fs::MetadataExt;
+use tracing::{debug, error};
 use crate::error::{Result, FsError};
 use crate::fs::{FileSystem, FileMetadata};
 
@@ -65,18 +66,33 @@ impl FileSystem for HybridStorage {
     }
 
     async fn write_file<'a>(&'a self, path: &'a Path, data: &'a [u8]) -> Result<()> {
-        if data.len() as u64 >= self.threshold {
-            self.cold_storage.write_file(path, data).await
+        let storage = if data.len() as u64 >= self.threshold {
+            &self.cold_storage
         } else {
-            self.hot_storage.write_file(path, data).await
+            &self.hot_storage
+        };
+        
+        // 如果文件存在于另一个存储中，先删除它
+        let other_storage = if data.len() as u64 >= self.threshold {
+            &self.hot_storage
+        } else {
+            &self.cold_storage
+        };
+        
+        if other_storage.exists(path).await? {
+            other_storage.delete(path).await?;
         }
+        
+        storage.write_file(path, data).await
     }
 
     async fn create_file<'a>(&'a self, path: &'a Path) -> Result<()> {
+        // 创建文件时，先在 hot 存储中创建
         self.hot_storage.create_file(path).await
     }
 
     async fn create_directory<'a>(&'a self, path: &'a Path) -> Result<()> {
+        // 目录只在 hot 存储中创建
         self.hot_storage.create_directory(path).await
     }
 
@@ -108,6 +124,12 @@ impl FileSystem for LocalStorage {
     async fn list_directory<'a>(&'a self, path: &'a Path) -> Result<Vec<String>> {
         let full_path = self.root.join(path);
         let mut entries = Vec::new();
+        
+        // 如果目录不存在，返回空列表
+        if !full_path.exists() {
+            return Ok(entries);
+        }
+
         let mut dir = tokio::fs::read_dir(&full_path)
             .await
             .map_err(|e| FsError::Io(e))?;
@@ -141,14 +163,22 @@ impl FileSystem for LocalStorage {
 
     async fn write_file<'a>(&'a self, path: &'a Path, data: &'a [u8]) -> Result<()> {
         let full_path = self.root.join(path);
+        debug!("write_file: writing to {:?}, size={}", full_path, data.len());
         if let Some(parent) = full_path.parent() {
+            debug!("write_file: creating parent directory {:?}", parent);
             tokio::fs::create_dir_all(parent)
                 .await
-                .map_err(|e| FsError::Io(e))?;
+                .map_err(|e| {
+                    error!("write_file: failed to create parent directory: {:?}", e);
+                    FsError::Io(e)
+                })?;
         }
         tokio::fs::write(&full_path, data)
             .await
-            .map_err(|e| FsError::Io(e))
+            .map_err(|e| {
+                error!("write_file: failed to write file: {:?}", e);
+                FsError::Io(e)
+            })
     }
 
     async fn create_file<'a>(&'a self, path: &'a Path) -> Result<()> {
