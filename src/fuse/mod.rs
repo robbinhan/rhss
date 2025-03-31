@@ -163,7 +163,15 @@ impl Filesystem for FuseAdapter {
                     reply.entry(&TTL, &attr, 0);
                 }
                 Err(e) => {
-                    error!("lookup error for path={:?}: {:?}", path_clone, e);
+                    if let Some(name_str) = path_clone.file_name().and_then(|n| n.to_str()) {
+                        if name_str.starts_with("._") {
+                            debug!("lookup: ignoring macOS metadata file: {:?}", path_clone);
+                        } else {
+                            error!("lookup error for path={:?}: {:?}", path_clone, e);
+                        }
+                    } else {
+                        error!("lookup error for path={:?}: {:?}", path_clone, e);
+                    }
                     reply.error(ENOENT);
                 }
             }

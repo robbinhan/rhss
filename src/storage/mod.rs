@@ -135,13 +135,28 @@ impl FileSystem for LocalStorage {
             .map_err(|e| FsError::Io(e))?;
         while let Some(entry) = dir.next_entry().await.map_err(|e| FsError::Io(e))? {
             if let Some(name) = entry.file_name().to_str() {
-                entries.push(name.to_string());
+                // 忽略 macOS 的元数据文件
+                if !name.starts_with("._") {
+                    entries.push(name.to_string());
+                } else {
+                    debug!("Ignoring macOS metadata file in list_directory: {}", name);
+                }
             }
         }
         Ok(entries)
     }
 
     async fn get_metadata<'a>(&'a self, path: &'a Path) -> Result<FileMetadata> {
+        // 忽略 macOS 的元数据文件查询
+        if let Some(name) = path.file_name() {
+            if let Some(name_str) = name.to_str() {
+                if name_str.starts_with("._") {
+                    debug!("Ignoring macOS metadata file in get_metadata: {}", name_str);
+                    return Err(FsError::NotFound(format!("Ignoring macOS metadata file: {}", name_str)));
+                }
+            }
+        }
+
         let full_path = self.root.join(path);
         let metadata = tokio::fs::metadata(&full_path)
             .await
