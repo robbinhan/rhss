@@ -2,10 +2,10 @@ use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
 use fuser::{
     FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, ReplyCreate, Request, FUSE_ROOT_ID,
+    ReplyWrite, ReplyCreate, Request, FUSE_ROOT_ID, MountOption,
 };
 use libc::{ENOENT, ENOSYS};
 use crate::fs::FileSystem;
@@ -87,10 +87,11 @@ struct FuseState {
     next_fh: Mutex<u64>,
     fh_to_path: Mutex<HashMap<u64, PathBuf>>,
     config: FuseConfig,
+    running: Arc<AtomicBool>,
 }
 
 impl FuseState {
-    fn new(fs: Box<dyn FileSystem>, config: FuseConfig) -> Self {
+    fn new(fs: Box<dyn FileSystem>, config: FuseConfig, running: Arc<AtomicBool>) -> Self {
         let mut path_to_ino = HashMap::new();
         let mut ino_to_path = HashMap::new();
         let root_path = PathBuf::from("");
@@ -105,6 +106,7 @@ impl FuseState {
             next_fh: Mutex::new(1),
             fh_to_path: Mutex::new(HashMap::new()),
             config,
+            running,
         }
     }
 
@@ -177,20 +179,28 @@ impl FuseState {
     }
 }
 
+#[derive(Clone)]
 pub struct FuseAdapter {
     state: Arc<FuseState>,
 }
 
 impl FuseAdapter {
     pub fn new(fs: Box<dyn FileSystem>, config: FuseConfig) -> Self {
+        let running = Arc::new(AtomicBool::new(true));
         Self {
-            state: Arc::new(FuseState::new(fs, config)),
+            state: Arc::new(FuseState::new(fs, config, running)),
         }
     }
 
-    pub fn mount(self, mount_point: &Path) -> std::io::Result<()> {
+    pub fn mount(&self, mount_point: &Path) -> std::io::Result<()> {
         info!("Mounting FUSE filesystem at {:?}", mount_point);
-        fuser::mount2(self, mount_point, &[])?;
+        let options = [
+            MountOption::CUSTOM("volname=RHSS_Mount".to_string()),
+            MountOption::CUSTOM("local".to_string()),
+            MountOption::FSName("rhss_fs".to_string()),
+            MountOption::DefaultPermissions,
+        ];
+        fuser::mount2(self.clone(), mount_point, &options)?;
         Ok(())
     }
 
@@ -201,10 +211,39 @@ impl FuseAdapter {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(f)
     }
+
+    pub fn stop(&self) {
+        info!("正在停止文件系统...");
+        self.state.running.store(false, Ordering::SeqCst);
+        
+        // 等待所有文件句柄被释放
+        let mut retry_count = 0;
+        const MAX_RETRIES: u32 = 10;
+        
+        while retry_count < MAX_RETRIES {
+            let fh_count = self.state.fh_to_path.lock().unwrap().len();
+            if fh_count == 0 {
+                info!("所有文件句柄已释放");
+                break;
+            }
+            info!("等待 {} 个文件句柄释放...", fh_count);
+            std::thread::sleep(std::time::Duration::from_millis(100));
+            retry_count += 1;
+        }
+        
+        if retry_count >= MAX_RETRIES {
+            warn!("等待文件句柄释放超时");
+        }
+    }
 }
 
 impl Filesystem for FuseAdapter {
     fn lookup(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEntry) {
+        if !self.state.running.load(Ordering::SeqCst) {
+            reply.error(ENOSYS);
+            return;
+        }
+
         let path = match self.state.get_path(parent, Some(name)) {
             Some(p) => p,
             None => {
@@ -242,6 +281,10 @@ impl Filesystem for FuseAdapter {
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+        if !self.state.running.load(Ordering::SeqCst) {
+            reply.error(ENOSYS);
+            return;
+        }
         debug!("getattr: ino={}", ino);
         if ino == FUSE_ROOT_ID {
             let attr = self.state.make_file_attr(ino, 0, 0o755, true);
