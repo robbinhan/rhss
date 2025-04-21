@@ -4,6 +4,7 @@ use std::os::unix::fs::MetadataExt;
 use tracing::{debug, error};
 use crate::error::{Result, FsError};
 use crate::fs::{FileSystem, FileMetadata};
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum StorageTier {
@@ -47,10 +48,16 @@ impl HybridStorage {
 #[async_trait]
 impl FileSystem for HybridStorage {
     async fn list_directory<'a>(&'a self, path: &'a Path) -> Result<Vec<String>> {
-        let mut entries = self.hot_storage.list_directory(path).await?;
+        let hot_entries = self.hot_storage.list_directory(path).await?;
         let cold_entries = self.cold_storage.list_directory(path).await?;
-        entries.extend(cold_entries);
-        Ok(entries)
+
+        // 计算去重后的并集
+        let mut combined_set: HashSet<String> = hot_entries.into_iter().collect();
+        combined_set.extend(cold_entries);
+
+        let unique_entries: Vec<String> = combined_set.into_iter().collect();
+
+        Ok(unique_entries)
     }
 
     async fn get_metadata<'a>(&'a self, path: &'a Path) -> Result<FileMetadata> {
