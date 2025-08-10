@@ -330,7 +330,7 @@ impl Filesystem for FuseAdapter {
         });
     }
 
-    fn getattr(&mut self, _req: &Request, ino: u64, reply: ReplyAttr) {
+    fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
         if !self.state.running.load(Ordering::SeqCst) {
             reply.error(ENOSYS);
             return;

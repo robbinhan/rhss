@@ -8,10 +8,6 @@ use crate::cache::{FileLocationCache, StorageLocation};
 use std::collections::HashSet;
 use rustix::fs::{Mode, OFlags};
 use rustix::process::{Gid, Uid};
-use std::time::SystemTime;
-use std::os::fd::{AsRawFd, RawFd};
-use std::fs::File;
-use std::io::{Read, Write};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 
