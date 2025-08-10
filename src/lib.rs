@@ -3,6 +3,8 @@ pub mod fs;
 pub mod storage;
 pub mod fuse;
 pub mod posix;
+pub mod lock;
+pub mod cache;
 
 pub use error::{FsError, Result};
 pub use fs::{FileSystem, VirtualFileSystem, FileMetadata};

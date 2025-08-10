@@ -10,6 +10,7 @@ use fuser::{
 use libc::{ENOENT, ENOSYS};
 use crate::fs::FileSystem;
 use tracing::{info, error, debug, warn};
+use tokio::runtime::Handle;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -88,10 +89,11 @@ struct FuseState {
     fh_to_path: Mutex<HashMap<u64, PathBuf>>,
     config: FuseConfig,
     running: Arc<AtomicBool>,
+    runtime_handle: Handle,
 }
 
 impl FuseState {
-    fn new(fs: Box<dyn FileSystem>, config: FuseConfig, running: Arc<AtomicBool>) -> Self {
+    fn new(fs: Box<dyn FileSystem>, config: FuseConfig, running: Arc<AtomicBool>, runtime_handle: Handle) -> Self {
         let mut path_to_ino = HashMap::new();
         let mut ino_to_path = HashMap::new();
         let root_path = PathBuf::from("");
@@ -107,6 +109,7 @@ impl FuseState {
             fh_to_path: Mutex::new(HashMap::new()),
             config,
             running,
+            runtime_handle,
         }
     }
 
@@ -177,6 +180,11 @@ impl FuseState {
         let mut fh_to_path = self.fh_to_path.lock().unwrap();
         fh_to_path.remove(&fh);
     }
+
+    // 添加公共方法来检查运行状态
+    pub fn is_running(&self) -> bool {
+        self.running.load(Ordering::SeqCst)
+    }
 }
 
 #[derive(Clone)]
@@ -185,10 +193,10 @@ pub struct FuseAdapter {
 }
 
 impl FuseAdapter {
-    pub fn new(fs: Box<dyn FileSystem>, config: FuseConfig) -> Self {
+    pub fn new(fs: Box<dyn FileSystem>, config: FuseConfig, runtime_handle: Handle) -> Self {
         let running = Arc::new(AtomicBool::new(true));
         Self {
-            state: Arc::new(FuseState::new(fs, config, running)),
+            state: Arc::new(FuseState::new(fs, config, running, runtime_handle)),
         }
     }
 
@@ -199,6 +207,9 @@ impl FuseAdapter {
             MountOption::CUSTOM("local".to_string()),
             MountOption::FSName("rhss_fs".to_string()),
             MountOption::DefaultPermissions,
+            MountOption::CUSTOM("noapplex".to_string()),
+            // 添加自动卸载选项，当文件系统进程退出时自动卸载
+            MountOption::AutoUnmount,
         ];
         fuser::mount2(self.clone(), mount_point, &options)?;
         Ok(())
@@ -208,17 +219,20 @@ impl FuseAdapter {
     where
         F: std::future::Future<Output = T>,
     {
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        runtime.block_on(f)
+        self.state.runtime_handle.block_on(f)
     }
 
     pub fn stop(&self) {
         info!("正在停止文件系统...");
-        self.state.running.store(false, Ordering::SeqCst);
         
-        // 等待所有文件句柄被释放
+        // 1. 设置停止标志，阻止新的操作
+        self.state.running.store(false, Ordering::SeqCst);
+        info!("已设置停止标志，不再接受新的文件系统操作");
+        
+        // 2. 等待所有文件句柄被释放
         let mut retry_count = 0;
-        const MAX_RETRIES: u32 = 10;
+        const MAX_RETRIES: u32 = 30;  // 增加到3秒
+        const RETRY_INTERVAL_MS: u64 = 100;
         
         while retry_count < MAX_RETRIES {
             let fh_count = self.state.fh_to_path.lock().unwrap().len();
@@ -226,14 +240,44 @@ impl FuseAdapter {
                 info!("所有文件句柄已释放");
                 break;
             }
-            info!("等待 {} 个文件句柄释放...", fh_count);
-            std::thread::sleep(std::time::Duration::from_millis(100));
+            
+            // 前几次重试时显示详细信息
+            if retry_count < 5 || retry_count % 10 == 0 {
+                info!("等待 {} 个文件句柄释放... (尝试 {}/{})", 
+                      fh_count, retry_count + 1, MAX_RETRIES);
+            }
+            
+            std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
             retry_count += 1;
         }
         
         if retry_count >= MAX_RETRIES {
-            warn!("等待文件句柄释放超时");
+            let remaining_fh = self.state.fh_to_path.lock().unwrap().len();
+            if remaining_fh > 0 {
+                warn!("等待文件句柄释放超时，仍有 {} 个句柄未释放", remaining_fh);
+                
+                // 强制清理剩余的文件句柄
+                let mut fh_to_path = self.state.fh_to_path.lock().unwrap();
+                warn!("强制清理 {} 个未释放的文件句柄", fh_to_path.len());
+                fh_to_path.clear();
+            }
         }
+        
+        // 3. 清理 inode 映射表
+        {
+            let mut path_to_ino = self.state.path_to_ino.lock().unwrap();
+            let mut ino_to_path = self.state.ino_to_path.lock().unwrap();
+            info!("清理 inode 映射表（{} 个条目）", path_to_ino.len());
+            path_to_ino.clear();
+            ino_to_path.clear();
+        }
+        
+        info!("文件系统停止完成");
+    }
+
+    // 添加一个公共方法来委托给 state.is_running()
+    pub fn is_running(&self) -> bool {
+        self.state.is_running()
     }
 }
 
@@ -272,7 +316,13 @@ impl Filesystem for FuseAdapter {
                     if state.config.should_ignore(&path_clone) {
                         debug!("lookup: ignoring special path: {:?}", path_clone);
                     } else {
-                        error!("lookup error for path={:?}: {:?}", path_clone, e);
+                        error!(
+                            parent_ino = parent,
+                            name = ?name,
+                            path = ?path_clone, 
+                            error = ?e, 
+                            "lookup error in fs.get_metadata"
+                        );
                     }
                     reply.error(ENOENT);
                 }
@@ -650,5 +700,61 @@ impl Filesystem for FuseAdapter {
         debug!("release: fh={}", fh);
         self.state.release_fh(fh);
         reply.ok();
+    }
+
+    fn setattr(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+        _ctime: Option<SystemTime>,
+        fh: Option<u64>,
+        _crtime: Option<SystemTime>,
+        _chgtime: Option<SystemTime>,
+        _bkuptime: Option<SystemTime>,
+        flags: Option<u32>,
+        reply: ReplyAttr,
+    ) {
+        debug!(ino, ?mode, ?uid, ?gid, ?size, ?atime, ?mtime, ?fh, ?flags, "setattr called");
+
+        let path = match fh.and_then(|h| self.state.get_path_from_fh(h)) {
+            Some(p) => p,
+            None => match self.state.get_path(ino, None) {
+                Some(p) => p,
+                None => {
+                    error!("setattr: failed to get path for ino={}", ino);
+                    reply.error(libc::ENOENT);
+                    return;
+                }
+            }
+        };
+
+        let state = Arc::clone(&self.state);
+        let path_clone = path.clone();
+
+        let _result = self.run_async(async move {
+            match state.fs.get_metadata(&path_clone).await {
+                Ok(metadata) => {
+                    // 完全忽略 setattr 请求的参数，仅返回当前获取的元数据
+                    let attr = state.make_file_attr(
+                        ino,
+                        metadata.size,
+                        metadata.permissions,
+                        metadata.is_dir,
+                    );
+                    debug!("setattr: replying with UNMODIFIED attrs for path={:?}, ino={}", path_clone, ino);
+                    reply.attr(&TTL, &attr);
+                }
+                Err(e) => {
+                    error!("setattr: getattr error for path={:?}: {:?}", path_clone, e);
+                    reply.error(libc::ENOENT);
+                }
+            }
+        });
     }
 } 
