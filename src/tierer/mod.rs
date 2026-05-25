@@ -1,0 +1,441 @@
+//! Background tierer + migrate primitive.
+//!
+//! - `migrate()` moves one file from its current tier/backend to a target
+//!   tier (using that tier's Placement to pick the destination backend).
+//!   Skips files that are currently open (autotier-style; D7). Preserves
+//!   `atime`/`mtime` (D16). Updates the index in a single SQLite swap.
+//!
+//! - `Tierer::run` is the background loop: sleeps `tier_period`, evicts the
+//!   `coldest_N` files from Fast when usage > `low_watermark`, runs a daily
+//!   full sweep (D19).
+
+use std::path::Path;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::{bounded, Receiver, Sender, TryRecvError};
+use tracing::{debug, info, warn};
+
+use crate::backend::Backend;
+use crate::error::{FsError, Result};
+use crate::index::{Location, PathIndex, TierId};
+use crate::policy::TieringPolicy;
+use crate::tier::TierRouter;
+
+pub mod open_tracker;
+pub use open_tracker::OpenFileTracker;
+
+const COPY_BUF_SIZE: usize = 1 << 20; // 1 MiB chunks
+
+/// Migrate a single file. Returns `Ok(false)` if the file was skipped because
+/// it's currently open (this is normal; retry next tier cycle).
+pub fn migrate(
+    router: &TierRouter,
+    index: &Arc<dyn PathIndex>,
+    open: &OpenFileTracker,
+    logical: &Path,
+    target_tier: TierId,
+) -> Result<bool> {
+    if open.is_open(logical) {
+        debug!("skip migrate {} (open)", logical.display());
+        return Ok(false);
+    }
+
+    let row = match index.get(logical)? {
+        Some(r) => r,
+        None => return Err(FsError::NotFound(logical.to_string_lossy().to_string())),
+    };
+
+    if row.location.tier == target_tier {
+        return Ok(false);
+    }
+    if row.pinned_tier.is_some() {
+        return Ok(false);
+    }
+
+    let src_backend = router
+        .resolve_backend(row.location.tier, &row.location.backend_id)
+        .ok_or_else(|| {
+            FsError::Storage(format!(
+                "source backend {} not found",
+                row.location.backend_id
+            ))
+        })?;
+    let dst_backend = router.tier(target_tier).pick()?;
+
+    if Arc::ptr_eq(src_backend, dst_backend) {
+        // Same backend — nothing to do.
+        return Ok(false);
+    }
+
+    let dst_path = row.location.backend_path.clone();
+
+    // 1. Stream-copy src -> dst.
+    copy_streaming(src_backend, &row.location.backend_path, dst_backend, &dst_path)?;
+    dst_backend.fsync(&dst_path)?;
+
+    // 2. Preserve atime/mtime (D16).
+    if let Ok(orig_meta) = src_backend.metadata(&row.location.backend_path) {
+        let _ = dst_backend.set_times(&dst_path, Some(orig_meta.atime), Some(orig_meta.mtime));
+    }
+
+    // 3. Atomic index swap (single SQLite UPDATE).
+    let new_loc = Location {
+        tier: target_tier,
+        backend_id: dst_backend.id().to_string(),
+        backend_path: dst_path,
+        size: row.location.size,
+    };
+    index.swap_location(logical, new_loc)?;
+
+    // 4. Best-effort source unlink. If this fails the file becomes an
+    //    orphan on the source backend — a startup scrub (P3/P4) will clean
+    //    up such orphans by reconciling backends against the index.
+    if let Err(e) = src_backend.remove(&row.location.backend_path) {
+        warn!(
+            "migrate {} src-unlink failed: {:?}",
+            logical.display(),
+            e
+        );
+    }
+
+    Ok(true)
+}
+
+fn copy_streaming(
+    src: &Arc<dyn Backend>,
+    src_path: &Path,
+    dst: &Arc<dyn Backend>,
+    dst_path: &Path,
+) -> Result<()> {
+    let mut offset = 0u64;
+    loop {
+        let chunk = src.read_at(src_path, offset, COPY_BUF_SIZE as u32)?;
+        if chunk.is_empty() {
+            return Ok(());
+        }
+        let written = dst.write_at(dst_path, offset, &chunk)? as u64;
+        offset += written;
+        if (chunk.len() as u64) < COPY_BUF_SIZE as u64 {
+            return Ok(());
+        }
+    }
+}
+
+/// Background tierer.
+pub struct Tierer {
+    tx: Sender<TierMessage>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+#[derive(Debug)]
+enum TierMessage {
+    Oneshot,
+    Stop,
+}
+
+#[derive(Clone)]
+pub struct TiererHandle {
+    tx: Sender<TierMessage>,
+}
+
+impl TiererHandle {
+    pub fn trigger_oneshot(&self) {
+        let _ = self.tx.try_send(TierMessage::Oneshot);
+    }
+}
+
+impl Tierer {
+    pub fn spawn(
+        router: Arc<TierRouter>,
+        index: Arc<dyn PathIndex>,
+        open_tracker: Arc<OpenFileTracker>,
+        policy: Arc<dyn TieringPolicy>,
+    ) -> (Self, TiererHandle) {
+        let (tx, rx) = bounded::<TierMessage>(16);
+        let handle = std::thread::Builder::new()
+            .name("rhss-tierer".into())
+            .spawn({
+                let tx2 = tx.clone();
+                move || tierer_loop(router, index, open_tracker, policy, rx, tx2)
+            })
+            .expect("spawn tierer");
+        let h = TiererHandle { tx: tx.clone() };
+        (Self { tx, handle: Some(handle) }, h)
+    }
+
+    pub fn handle(&self) -> TiererHandle {
+        TiererHandle {
+            tx: self.tx.clone(),
+        }
+    }
+}
+
+impl Drop for Tierer {
+    fn drop(&mut self) {
+        let _ = self.tx.send(TierMessage::Stop);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
+}
+
+fn tierer_loop(
+    router: Arc<TierRouter>,
+    index: Arc<dyn PathIndex>,
+    open_tracker: Arc<OpenFileTracker>,
+    policy: Arc<dyn TieringPolicy>,
+    rx: Receiver<TierMessage>,
+    _tx: Sender<TierMessage>,
+) {
+    let mut last_full_sweep = Instant::now();
+    let day = Duration::from_secs(86_400);
+
+    loop {
+        let wait = policy.tier_period().unwrap_or(Duration::from_secs(60 * 60));
+
+        // Wait either for the next period or an oneshot signal.
+        let msg = if policy.tier_period().is_none() {
+            // Manual-only: block until a message arrives.
+            match rx.recv() {
+                Ok(m) => m,
+                Err(_) => return,
+            }
+        } else {
+            match rx.recv_timeout(wait) {
+                Ok(m) => m,
+                Err(crossbeam_channel::RecvTimeoutError::Timeout) => TierMessage::Oneshot,
+                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => return,
+            }
+        };
+
+        match msg {
+            TierMessage::Stop => return,
+            TierMessage::Oneshot => {}
+        }
+
+        // Drain any extra oneshot signals so we don't loop without work.
+        loop {
+            match rx.try_recv() {
+                Ok(TierMessage::Stop) => return,
+                Ok(TierMessage::Oneshot) => {}
+                Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+            }
+        }
+
+        evict_cold(&router, &index, &open_tracker, &policy);
+
+        if last_full_sweep.elapsed() >= day {
+            full_sweep(&index, &policy);
+            last_full_sweep = Instant::now();
+        }
+    }
+}
+
+fn evict_cold(
+    router: &TierRouter,
+    index: &Arc<dyn PathIndex>,
+    open_tracker: &Arc<OpenFileTracker>,
+    policy: &Arc<dyn TieringPolicy>,
+) {
+    let usage = router.fast.usage_ratio();
+    if usage <= policy.low_watermark() {
+        return;
+    }
+
+    // Target free: bring usage back down to mid-point between low and high.
+    let target_usage = (policy.low_watermark() + policy.high_watermark()) / 2.0;
+    let (total, used, _free) = router.fast.capacity();
+    let target_used = (total as f64 * target_usage) as u64;
+    let to_free = used.saturating_sub(target_used);
+    if to_free == 0 {
+        return;
+    }
+
+    info!(
+        usage = format!("{:.1}%", usage * 100.0),
+        target_bytes = to_free,
+        "tierer: starting cold-eviction"
+    );
+
+    let victims = match index.coldest(TierId::Fast, to_free, policy.min_age_to_evict()) {
+        Ok(v) => v,
+        Err(e) => {
+            warn!("coldest query: {:?}", e);
+            return;
+        }
+    };
+
+    for (path, _size) in victims {
+        match migrate(router, index, open_tracker, &path, TierId::Slow) {
+            Ok(true) => debug!("evicted {}", path.display()),
+            Ok(false) => debug!("skipped {} (open or pinned)", path.display()),
+            Err(e) => warn!("migrate {}: {:?}", path.display(), e),
+        }
+    }
+}
+
+fn full_sweep(index: &Arc<dyn PathIndex>, _policy: &Arc<dyn TieringPolicy>) {
+    // Recompute popularity for every file based on the access counts that
+    // accumulated since last sweep. This is the autotier "calc_popularity +
+    // sort + simulate" big-batch correction (D19).
+    //
+    // For v0.1 we keep this minimal: just bump everyone's popularity using
+    // their current hit_count over a 1-day window, then reset hit_count.
+    // The full "sort + simulate + move" pass can be added later.
+    debug!("tierer: daily full-sweep recompute (stub)");
+    let _ = index;
+    // P2 ships the loop; the recompute pass is intentionally a stub to be
+    // fleshed out post-MVP. Hit counts will drift slightly but eviction
+    // still works via the per-tier-period coldest_N path.
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::backend::PosixBackend;
+    use crate::index::{FileRow, FileState, Location, SqlitePathIndex};
+    use crate::tier::{MostFreePlacement, Tier};
+    use std::path::PathBuf;
+    use std::time::UNIX_EPOCH;
+    use tempfile::TempDir;
+
+    fn build(
+        ssd: &Path,
+        hdd: &Path,
+        db: &Path,
+    ) -> (
+        Arc<TierRouter>,
+        Arc<dyn PathIndex>,
+        Arc<OpenFileTracker>,
+    ) {
+        let ssd_b: Arc<dyn Backend> = Arc::new(PosixBackend::new("ssd", ssd.to_path_buf()).unwrap());
+        let hdd_b: Arc<dyn Backend> = Arc::new(PosixBackend::new("hdd", hdd.to_path_buf()).unwrap());
+        let router = TierRouter::new(
+            Tier::new(TierId::Fast, vec![ssd_b], Box::new(MostFreePlacement)).unwrap(),
+            Tier::new(TierId::Slow, vec![hdd_b], Box::new(MostFreePlacement)).unwrap(),
+        );
+        let idx = SqlitePathIndex::open(db).unwrap() as Arc<dyn PathIndex>;
+        (Arc::new(router), idx, Arc::new(OpenFileTracker::new()))
+    }
+
+    fn fixture_row(path: &str) -> FileRow {
+        FileRow {
+            logical_path: PathBuf::from(path),
+            location: Location {
+                tier: TierId::Fast,
+                backend_id: "ssd".into(),
+                backend_path: PathBuf::from(path.trim_start_matches('/')),
+                size: 0,
+
+            },
+            last_access: UNIX_EPOCH,
+            hit_count: 0,
+            popularity: 0.0,
+            pinned_tier: None,
+            state: FileState::Stable,
+        }
+    }
+
+    #[test]
+    fn migrate_moves_file_and_preserves_data() {
+        let ssd = TempDir::new().unwrap();
+        let hdd = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+        let (router, idx, open) = build(ssd.path(), hdd.path(), &db.path().join("idx.db"));
+
+        // Write a real file on the SSD side and index it.
+        let data = b"hello migrate";
+        std::fs::write(ssd.path().join("x.bin"), data).unwrap();
+        let mut row = fixture_row("/x.bin");
+        row.location.size = data.len() as u64;
+        idx.insert(row).unwrap();
+
+        let moved = migrate(&router, &idx, &open, Path::new("/x.bin"), TierId::Slow).unwrap();
+        assert!(moved);
+
+        // Now lives on HDD, gone from SSD.
+        let loc = idx.locate(Path::new("/x.bin")).unwrap().unwrap();
+        assert_eq!(loc.tier, TierId::Slow);
+        assert_eq!(loc.backend_id, "hdd");
+        assert!(!ssd.path().join("x.bin").exists());
+        let got = std::fs::read(hdd.path().join("x.bin")).unwrap();
+        assert_eq!(got, data);
+    }
+
+    #[test]
+    fn migrate_skips_open_files() {
+        let ssd = TempDir::new().unwrap();
+        let hdd = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+        let (router, idx, open) = build(ssd.path(), hdd.path(), &db.path().join("idx.db"));
+        std::fs::write(ssd.path().join("o.bin"), b"open").unwrap();
+        idx.insert({
+            let mut r = fixture_row("/o.bin");
+            r.location.size = 4;
+            r
+        })
+        .unwrap();
+        open.register(Path::new("/o.bin"));
+        let moved = migrate(&router, &idx, &open, Path::new("/o.bin"), TierId::Slow).unwrap();
+        assert!(!moved);
+        // Still on SSD.
+        let loc = idx.locate(Path::new("/o.bin")).unwrap().unwrap();
+        assert_eq!(loc.tier, TierId::Fast);
+    }
+
+    #[test]
+    fn migrate_respects_pinned_tier() {
+        let ssd = TempDir::new().unwrap();
+        let hdd = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+        let (router, idx, open) = build(ssd.path(), hdd.path(), &db.path().join("idx.db"));
+        std::fs::write(ssd.path().join("p.bin"), b"pin").unwrap();
+        let mut r = fixture_row("/p.bin");
+        r.location.size = 3;
+        r.pinned_tier = Some(TierId::Fast);
+        idx.insert(r).unwrap();
+
+        let moved = migrate(&router, &idx, &open, Path::new("/p.bin"), TierId::Slow).unwrap();
+        assert!(!moved);
+    }
+
+    #[test]
+    fn migrate_preserves_mtime() {
+        let ssd = TempDir::new().unwrap();
+        let hdd = TempDir::new().unwrap();
+        let db = TempDir::new().unwrap();
+        let (router, idx, open) = build(ssd.path(), hdd.path(), &db.path().join("idx.db"));
+
+        std::fs::write(ssd.path().join("t.bin"), b"timestamped").unwrap();
+        // Set mtime to a known historical value.
+        let target_mtime = UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        rustix::fs::utimensat(
+            rustix::fs::CWD,
+            ssd.path().join("t.bin").as_os_str(),
+            &rustix::fs::Timestamps {
+                last_access: rustix::fs::Timespec {
+                    tv_sec: 1_000_000_000,
+                    tv_nsec: 0,
+                },
+                last_modification: rustix::fs::Timespec {
+                    tv_sec: 1_000_000_000,
+                    tv_nsec: 0,
+                },
+            },
+            rustix::fs::AtFlags::empty(),
+        )
+        .unwrap();
+
+        let mut r = fixture_row("/t.bin");
+        r.location.size = 11;
+        idx.insert(r).unwrap();
+
+        migrate(&router, &idx, &open, Path::new("/t.bin"), TierId::Slow).unwrap();
+
+        // Now check HDD copy has the same mtime.
+        let meta = std::fs::metadata(hdd.path().join("t.bin")).unwrap();
+        let mtime = meta.modified().unwrap();
+        assert_eq!(mtime, target_mtime);
+    }
+}

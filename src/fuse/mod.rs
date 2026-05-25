@@ -23,8 +23,10 @@ use tracing::{debug, error, info, warn};
 use crate::access::AccessTracker;
 use crate::backend::{Backend, FileMetadata as BackendMeta};
 use crate::error::FsError;
-use crate::index::{FileRow, FileState, Location, PathIndex, TierId};
+use crate::index::{FileRow, FileState, Location, PathIndex};
+use crate::policy::TieringPolicy;
 use crate::tier::TierRouter;
+use crate::tierer::OpenFileTracker;
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -122,6 +124,8 @@ struct FhEntry {
 struct FuseState {
     router: Arc<TierRouter>,
     index: Arc<dyn PathIndex>,
+    policy: Arc<dyn TieringPolicy>,
+    open_tracker: Arc<OpenFileTracker>,
     access: Option<AccessTracker>,
     inodes: Mutex<InodeMap>,
     fh_table: Mutex<HashMap<u64, FhEntry>>,
@@ -218,6 +222,8 @@ impl FuseAdapter {
     pub fn new(
         router: Arc<TierRouter>,
         index: Arc<dyn PathIndex>,
+        policy: Arc<dyn TieringPolicy>,
+        open_tracker: Arc<OpenFileTracker>,
         access: Option<AccessTracker>,
         config: FuseConfig,
     ) -> Self {
@@ -225,6 +231,8 @@ impl FuseAdapter {
             state: Arc::new(FuseState {
                 router,
                 index,
+                policy,
+                open_tracker,
                 access,
                 inodes: Mutex::new(InodeMap::new()),
                 fh_table: Mutex::new(HashMap::new()),
@@ -436,6 +444,7 @@ impl Filesystem for FuseAdapter {
             reply.error(errno(&e));
             return;
         }
+        self.state.open_tracker.register(&logical);
         let fh = self.state.allocate_fh(FhEntry {
             logical: logical.clone(),
             backend,
@@ -457,7 +466,9 @@ impl Filesystem for FuseAdapter {
         _flush: bool,
         reply: ReplyEmpty,
     ) {
-        self.state.release_fh(fh);
+        if let Some(logical) = self.state.release_fh(fh) {
+            self.state.open_tracker.release(&logical);
+        }
         reply.ok();
     }
 
@@ -480,9 +491,10 @@ impl Filesystem for FuseAdapter {
             return;
         }
 
-        // Pick destination backend (P2 will add panic_watermark routing; for
-        // now always Fast).
-        let tier = TierId::Fast;
+        // Watermark routing (D6 / D17 / D20). When Fast is over panic, new
+        // files go directly to Slow so we don't hit ENOSPC on Fast.
+        let fast_usage = self.state.router.fast.usage_ratio();
+        let tier = self.state.policy.tier_for_create(fast_usage);
         let backend = match self.state.router.tier(tier).pick() {
             Ok(b) => Arc::clone(b),
             Err(e) => {
@@ -516,7 +528,7 @@ impl Filesystem for FuseAdapter {
             },
             last_access: SystemTime::now(),
             hit_count: 0,
-            popularity: 0.0,
+            popularity: self.state.policy.initial_popularity(), // D17
             pinned_tier: None,
             state: FileState::Stable,
         };
@@ -526,6 +538,7 @@ impl Filesystem for FuseAdapter {
         }
 
         let ino = self.state.inodes.lock().allocate(logical.clone());
+        self.state.open_tracker.register(&logical);
         let fh = self.state.allocate_fh(FhEntry {
             logical,
             backend,

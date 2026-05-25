@@ -1,8 +1,6 @@
 //! rhss — Rust Hybrid Storage System.
 //!
-//! See `docs/plan/README.md` for the v2.3 plan. P0 + P1 baseline:
-//! sync Backend trait, offset-aware FUSE, persistent SQLite path index,
-//! multi-disk per-tier, first-scan ingestion. Background tierer comes in P2.
+//! v2.3 plan: see `docs/plan/README.md`.
 
 pub mod access;
 pub mod backend;
@@ -11,12 +9,16 @@ pub mod error;
 pub mod fuse;
 pub mod index;
 pub mod lock;
+pub mod policy;
 pub mod scan;
 pub mod tier;
+pub mod tierer;
 
 pub use backend::{Backend, BackendStats, FileMetadata, PosixBackend};
 pub use config::RhssConfig;
 pub use error::{FsError, Result};
 pub use fuse::FuseAdapter;
 pub use index::{PathIndex, SqlitePathIndex, TierId};
+pub use policy::{PopularityPolicy, TieringPolicy};
 pub use tier::{Tier, TierRouter};
+pub use tierer::{OpenFileTracker, Tierer, TiererHandle};

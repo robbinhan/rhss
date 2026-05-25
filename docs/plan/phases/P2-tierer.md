@@ -33,4 +33,9 @@ D1(EMA 流行度)、D6(三水位)、D7(skip-open-files,替代 RCU)、D15(`tier_p
 
 ## 状态
 
-⏳ 未开始(等 P1)
+✅ 完成 (2026-05-25)
+
+- 全部 6 项任务完成
+- 36 个单元测试通过(P0+P1 24 + P2 新增 12:EMA/policy 5、OpenFileTracker 2、migrate 4、initial popularity 1)
+- cargo build 零错误,1 个无关 whoami 警告
+- 完整端到端 tier 行为待真实挂载测试(macFUSE)

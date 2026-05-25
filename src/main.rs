@@ -19,8 +19,10 @@ use rhss::config::RhssConfig;
 use rhss::fuse::FuseConfig;
 use rhss::index::{PathIndex, SqlitePathIndex, TierId};
 use rhss::lock::StorageLock;
+use rhss::policy::{PopularityPolicy, TieringPolicy};
 use rhss::scan;
 use rhss::tier::{MostFreePlacement, Tier, TierRouter};
+use rhss::tierer::{OpenFileTracker, Tierer};
 use rhss::{FuseAdapter, PosixBackend};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
@@ -145,10 +147,22 @@ fn main() {
     }
 
     let access = AccessTracker::start(Arc::clone(&index), Duration::from_secs(5));
+    let open_tracker = Arc::new(OpenFileTracker::new());
+    let policy: Arc<dyn TieringPolicy> = Arc::new(PopularityPolicy::default());
+
+    let (_tierer, _tierer_handle) = Tierer::spawn(
+        Arc::clone(&router),
+        Arc::clone(&index),
+        Arc::clone(&open_tracker),
+        Arc::clone(&policy),
+    );
+    info!("background tierer started");
 
     let adapter = FuseAdapter::new(
         Arc::clone(&router),
         Arc::clone(&index),
+        Arc::clone(&policy),
+        Arc::clone(&open_tracker),
         Some(access),
         FuseConfig::default(),
     );
