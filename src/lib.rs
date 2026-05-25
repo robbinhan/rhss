@@ -1,13 +1,24 @@
-pub mod error;
-pub mod fs;
-pub mod storage;
-pub mod fuse;
-pub mod posix;
-pub mod lock;
-pub mod cache;
+//! rhss — Rust Hybrid Storage System.
+//!
+//! v2.3 plan: see `docs/plan/README.md`.
 
+pub mod access;
+pub mod backend;
+pub mod config;
+pub mod error;
+pub mod fuse;
+pub mod index;
+pub mod lock;
+pub mod policy;
+pub mod scan;
+pub mod tier;
+pub mod tierer;
+
+pub use backend::{Backend, BackendStats, FileMetadata, PosixBackend};
+pub use config::RhssConfig;
 pub use error::{FsError, Result};
-pub use fs::{FileSystem, VirtualFileSystem, FileMetadata};
-pub use storage::{Storage, HybridStorage, StorageTier};
 pub use fuse::FuseAdapter;
-pub use posix::{PosixFile, PosixDirectory, PosixMetadata}; 
+pub use index::{PathIndex, SqlitePathIndex, TierId};
+pub use policy::{PopularityPolicy, TieringPolicy};
+pub use tier::{Tier, TierRouter};
+pub use tierer::{OpenFileTracker, Tierer, TiererHandle};

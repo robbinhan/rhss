@@ -1,40 +1,48 @@
+//! FUSE adapter — P1 version.
+//!
+//! Now backed by `TierRouter` (multi-disk) and `PathIndex` (SQLite). FUSE
+//! callbacks resolve `logical_path → Location → Backend` and call the right
+//! disk. Background tierer (P2) hasn't landed yet; new files always go to
+//! Fast for now, with no migration.
+
+use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, SystemTime};
-use std::collections::{HashMap, HashSet};
-use std::sync::{Arc, Mutex, atomic::{AtomicBool, Ordering}};
+
 use fuser::{
-    FileAttr, FileType, Filesystem, ReplyAttr, ReplyData, ReplyDirectory, ReplyEntry,
-    ReplyWrite, ReplyCreate, Request, FUSE_ROOT_ID, MountOption,
+    FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
 };
-use libc::{ENOENT, ENOSYS};
-use crate::fs::FileSystem;
-use tracing::{info, error, debug, warn};
-use tokio::runtime::Handle;
+use libc::{EEXIST, EIO, ENOENT, ENOSYS};
+use parking_lot::Mutex;
+use tracing::{debug, error, info, warn};
+
+use crate::access::AccessTracker;
+use crate::backend::{Backend, FileMetadata as BackendMeta};
+use crate::error::FsError;
+use crate::index::{FileRow, FileState, Location, PathIndex};
+use crate::policy::TieringPolicy;
+use crate::tier::TierRouter;
+use crate::tierer::{OpenFileTracker, TiererHandle};
 
 const TTL: Duration = Duration::from_secs(1);
 
 #[derive(Debug, Clone)]
 pub struct FuseConfig {
-    ignore_paths: HashSet<String>,
-    ignore_patterns: Vec<String>,
+    ignore_names: HashSet<String>,
+    ignore_prefixes: Vec<String>,
 }
 
 impl Default for FuseConfig {
     fn default() -> Self {
-        let mut ignore_paths = HashSet::new();
-        ignore_paths.insert(".DS_Store".to_string());
-        ignore_paths.insert(".hidden".to_string());
-        ignore_paths.insert(".git".to_string());
-        ignore_paths.insert("@executable_path".to_string());
-
-        let ignore_patterns = vec![
-            "._*".to_string(),  // macOS 元数据文件
-        ];
-
+        let mut ignore_names = HashSet::new();
+        ignore_names.insert(".DS_Store".to_string());
         Self {
-            ignore_paths,
-            ignore_patterns,
+            ignore_names,
+            ignore_prefixes: vec!["._".to_string()],
         }
     }
 }
@@ -44,240 +52,249 @@ impl FuseConfig {
         Self::default()
     }
 
-    pub fn with_ignore_paths(mut self, paths: Vec<String>) -> Self {
-        self.ignore_paths.extend(paths);
-        self
-    }
-
-    pub fn with_ignore_patterns(mut self, patterns: Vec<String>) -> Self {
-        self.ignore_patterns.extend(patterns);
-        self
-    }
-
     pub fn should_ignore(&self, path: &Path) -> bool {
-        if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-            // 检查完全匹配
-            if self.ignore_paths.contains(name) {
-                return true;
-            }
-
-            // 检查模式匹配
-            for pattern in &self.ignore_patterns {
-                if pattern.ends_with('*') {
-                    let prefix = &pattern[..pattern.len() - 1];
-                    if name.starts_with(prefix) {
-                        return true;
-                    }
-                }
-            }
-
-            // 检查单个字母
-            if name.len() == 1 {
-                return true;
-            }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            return false;
+        };
+        if self.ignore_names.contains(name) {
+            return true;
         }
-        false
+        self.ignore_prefixes
+            .iter()
+            .any(|prefix| name.starts_with(prefix))
     }
+}
+
+struct InodeMap {
+    path_to_ino: HashMap<PathBuf, u64>,
+    ino_to_path: HashMap<u64, PathBuf>,
+    next_ino: u64,
+}
+
+impl InodeMap {
+    fn new() -> Self {
+        let root_path = PathBuf::from("/");
+        let mut path_to_ino = HashMap::new();
+        let mut ino_to_path = HashMap::new();
+        path_to_ino.insert(root_path.clone(), FUSE_ROOT_ID);
+        ino_to_path.insert(FUSE_ROOT_ID, root_path);
+        Self {
+            path_to_ino,
+            ino_to_path,
+            next_ino: FUSE_ROOT_ID + 1,
+        }
+    }
+
+    fn allocate(&mut self, path: PathBuf) -> u64 {
+        if let Some(&ino) = self.path_to_ino.get(&path) {
+            return ino;
+        }
+        let ino = self.next_ino;
+        self.next_ino += 1;
+        self.path_to_ino.insert(path.clone(), ino);
+        self.ino_to_path.insert(ino, path);
+        ino
+    }
+
+    fn lookup_path(&self, ino: u64) -> Option<PathBuf> {
+        self.ino_to_path.get(&ino).cloned()
+    }
+
+    fn remove(&mut self, path: &Path) {
+        if let Some(ino) = self.path_to_ino.remove(path) {
+            self.ino_to_path.remove(&ino);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn rename(&mut self, from: &Path, to: PathBuf) {
+        if let Some(ino) = self.path_to_ino.remove(from) {
+            self.path_to_ino.insert(to.clone(), ino);
+            self.ino_to_path.insert(ino, to);
+        }
+    }
+}
+
+struct FhEntry {
+    logical: PathBuf,
+    backend: Arc<dyn Backend>,
+    backend_path: PathBuf,
 }
 
 struct FuseState {
-    fs: Box<dyn FileSystem>,
-    path_to_ino: Mutex<HashMap<PathBuf, u64>>,
-    ino_to_path: Mutex<HashMap<u64, PathBuf>>,
-    next_ino: Mutex<u64>,
-    next_fh: Mutex<u64>,
-    fh_to_path: Mutex<HashMap<u64, PathBuf>>,
+    router: Arc<TierRouter>,
+    index: Arc<dyn PathIndex>,
+    policy: Arc<dyn TieringPolicy>,
+    open_tracker: Arc<OpenFileTracker>,
+    tierer: Option<TiererHandle>,
+    access: Option<AccessTracker>,
+    inodes: Mutex<InodeMap>,
+    fh_table: Mutex<HashMap<u64, FhEntry>>,
+    next_fh: AtomicU64,
     config: FuseConfig,
-    running: Arc<AtomicBool>,
-    runtime_handle: Handle,
+    running: AtomicBool,
 }
 
 impl FuseState {
-    fn new(fs: Box<dyn FileSystem>, config: FuseConfig, running: Arc<AtomicBool>, runtime_handle: Handle) -> Self {
-        let mut path_to_ino = HashMap::new();
-        let mut ino_to_path = HashMap::new();
-        let root_path = PathBuf::from("");
-        path_to_ino.insert(root_path.clone(), FUSE_ROOT_ID);
-        ino_to_path.insert(FUSE_ROOT_ID, root_path);
-
-        Self {
-            fs,
-            path_to_ino: Mutex::new(path_to_ino),
-            ino_to_path: Mutex::new(ino_to_path),
-            next_ino: Mutex::new(FUSE_ROOT_ID + 1),
-            next_fh: Mutex::new(1),
-            fh_to_path: Mutex::new(HashMap::new()),
-            config,
-            running,
-            runtime_handle,
-        }
-    }
-
-    fn make_file_attr(&self, ino: u64, size: u64, mode: u32, is_dir: bool) -> FileAttr {
+    fn make_attr(&self, ino: u64, meta: &BackendMeta) -> FileAttr {
         FileAttr {
             ino,
-            size,
-            blocks: (size + 511) / 512,
-            atime: SystemTime::now(),
-            mtime: SystemTime::now(),
-            ctime: SystemTime::now(),
-            crtime: SystemTime::now(),
-            kind: if is_dir { FileType::Directory } else { FileType::RegularFile },
-            perm: mode as u16,
+            size: meta.size,
+            blocks: meta.size.div_ceil(512),
+            atime: meta.atime,
+            mtime: meta.mtime,
+            ctime: meta.ctime,
+            crtime: meta.ctime,
+            kind: if meta.is_dir {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            },
+            perm: meta.mode as u16,
             nlink: 1,
             uid: unsafe { libc::getuid() },
             gid: unsafe { libc::getgid() },
             rdev: 0,
             flags: 0,
-            blksize: 512,
+            blksize: 4096,
         }
     }
 
-    fn get_path(&self, parent: u64, name: Option<&OsStr>) -> Option<PathBuf> {
-        let ino_to_path = self.ino_to_path.lock().unwrap();
-        let parent_path = ino_to_path.get(&parent)?;
-        let mut path = parent_path.clone();
-        if let Some(name) = name {
-            path.push(name);
+    fn root_attr(&self) -> FileAttr {
+        let now = SystemTime::now();
+        FileAttr {
+            ino: FUSE_ROOT_ID,
+            size: 0,
+            blocks: 0,
+            atime: now,
+            mtime: now,
+            ctime: now,
+            crtime: now,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 2,
+            uid: unsafe { libc::getuid() },
+            gid: unsafe { libc::getgid() },
+            rdev: 0,
+            flags: 0,
+            blksize: 4096,
         }
-        debug!("get_path: parent={}, name={:?} -> {:?}", parent, name, path);
+    }
+
+    fn path_for(&self, parent: u64, name: &OsStr) -> Option<PathBuf> {
+        let inodes = self.inodes.lock();
+        let mut path = inodes.lookup_path(parent)?;
+        path.push(name);
         Some(path)
     }
 
-    fn allocate_ino(&self, path: PathBuf) -> u64 {
-        let mut path_to_ino = self.path_to_ino.lock().unwrap();
-        let mut ino_to_path = self.ino_to_path.lock().unwrap();
-        let mut next_ino = self.next_ino.lock().unwrap();
-
-        if let Some(&ino) = path_to_ino.get(&path) {
-            debug!("allocate_ino: reusing ino={} for path={:?}", ino, path);
-            return ino;
-        }
-
-        let ino = *next_ino;
-        *next_ino += 1;
-        path_to_ino.insert(path.clone(), ino);
-        ino_to_path.insert(ino, path.clone());
-        debug!("allocate_ino: new ino={} for path={:?}", ino, path);
-        ino
+    /// Resolve a logical path to (backend, backend-relative path) by looking
+    /// up the path index. Returns `None` if not indexed.
+    fn resolve(&self, logical: &Path) -> Option<(Arc<dyn Backend>, PathBuf)> {
+        let loc = self.index.locate(logical).ok().flatten()?;
+        let backend = self.router.resolve_backend(loc.tier, &loc.backend_id)?;
+        Some((Arc::clone(backend), loc.backend_path))
     }
 
-    fn allocate_fh(&self, path: PathBuf) -> u64 {
-        let mut next_fh = self.next_fh.lock().unwrap();
-        let mut fh_to_path = self.fh_to_path.lock().unwrap();
-        let fh = *next_fh;
-        *next_fh += 1;
-        fh_to_path.insert(fh, path);
+    fn allocate_fh(&self, entry: FhEntry) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
+        self.fh_table.lock().insert(fh, entry);
         fh
     }
 
-    fn get_path_from_fh(&self, fh: u64) -> Option<PathBuf> {
-        let fh_to_path = self.fh_to_path.lock().unwrap();
-        fh_to_path.get(&fh).cloned()
+    fn fh(&self, fh: u64) -> Option<(Arc<dyn Backend>, PathBuf, PathBuf)> {
+        let t = self.fh_table.lock();
+        t.get(&fh)
+            .map(|e| (Arc::clone(&e.backend), e.backend_path.clone(), e.logical.clone()))
     }
 
-    fn release_fh(&self, fh: u64) {
-        let mut fh_to_path = self.fh_to_path.lock().unwrap();
-        fh_to_path.remove(&fh);
-    }
-
-    // 添加公共方法来检查运行状态
-    pub fn is_running(&self) -> bool {
-        self.running.load(Ordering::SeqCst)
+    fn release_fh(&self, fh: u64) -> Option<PathBuf> {
+        self.fh_table.lock().remove(&fh).map(|e| e.logical)
     }
 }
 
+/// Top-level FUSE adapter.
 #[derive(Clone)]
 pub struct FuseAdapter {
     state: Arc<FuseState>,
 }
 
 impl FuseAdapter {
-    pub fn new(fs: Box<dyn FileSystem>, config: FuseConfig, runtime_handle: Handle) -> Self {
-        let running = Arc::new(AtomicBool::new(true));
+    pub fn new(
+        router: Arc<TierRouter>,
+        index: Arc<dyn PathIndex>,
+        policy: Arc<dyn TieringPolicy>,
+        open_tracker: Arc<OpenFileTracker>,
+        tierer: Option<TiererHandle>,
+        access: Option<AccessTracker>,
+        config: FuseConfig,
+    ) -> Self {
         Self {
-            state: Arc::new(FuseState::new(fs, config, running, runtime_handle)),
+            state: Arc::new(FuseState {
+                router,
+                index,
+                policy,
+                open_tracker,
+                tierer,
+                access,
+                inodes: Mutex::new(InodeMap::new()),
+                fh_table: Mutex::new(HashMap::new()),
+                next_fh: AtomicU64::new(1),
+                config,
+                running: AtomicBool::new(true),
+            }),
         }
     }
 
     pub fn mount(&self, mount_point: &Path) -> std::io::Result<()> {
-        info!("Mounting FUSE filesystem at {:?}", mount_point);
-        let options = [
-            MountOption::CUSTOM("volname=RHSS_Mount".to_string()),
-            MountOption::CUSTOM("local".to_string()),
-            MountOption::FSName("rhss_fs".to_string()),
-            MountOption::DefaultPermissions,
-            MountOption::CUSTOM("noapplex".to_string()),
-            // 添加自动卸载选项，当文件系统进程退出时自动卸载
-            MountOption::AutoUnmount,
-        ];
-        fuser::mount2(self.clone(), mount_point, &options)?;
+        info!("mounting rhss at {}", mount_point.display());
+        fuser::mount2(self.clone(), mount_point, &Self::mount_options())?;
         Ok(())
     }
 
-    fn run_async<F, T>(&self, f: F) -> T
-    where
-        F: std::future::Future<Output = T>,
-    {
-        self.state.runtime_handle.block_on(f)
+    pub fn spawn_mount(&self, mount_point: &Path) -> std::io::Result<fuser::BackgroundSession> {
+        info!("mounting rhss (multi-thread) at {}", mount_point.display());
+        fuser::spawn_mount2(self.clone(), mount_point, &Self::mount_options())
+    }
+
+    fn mount_options() -> Vec<MountOption> {
+        let mut opts = vec![
+            MountOption::DefaultPermissions,
+            MountOption::FSName("rhss".to_string()),
+            MountOption::AutoUnmount,
+        ];
+        #[cfg(target_os = "macos")]
+        {
+            opts.push(MountOption::CUSTOM("volname=rhss".to_string()));
+            opts.push(MountOption::CUSTOM("local".to_string()));
+            opts.push(MountOption::CUSTOM("noapplexattr".to_string()));
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // D20 / D21 — Linux perf path. macFUSE doesn't support any of
+            // these; the cfg gate is essential.
+            opts.push(MountOption::AllowOther);
+            opts.push(MountOption::CUSTOM("max_read=1048576".to_string()));   // 1 MiB
+            opts.push(MountOption::CUSTOM("max_write=1048576".to_string()));  // 1 MiB
+            opts.push(MountOption::CUSTOM("max_background=16".to_string()));
+            opts.push(MountOption::CUSTOM("congestion_threshold=12".to_string()));
+        }
+        opts
     }
 
     pub fn stop(&self) {
-        info!("正在停止文件系统...");
-        
-        // 1. 设置停止标志，阻止新的操作
         self.state.running.store(false, Ordering::SeqCst);
-        info!("已设置停止标志，不再接受新的文件系统操作");
-        
-        // 2. 等待所有文件句柄被释放
-        let mut retry_count = 0;
-        const MAX_RETRIES: u32 = 30;  // 增加到3秒
-        const RETRY_INTERVAL_MS: u64 = 100;
-        
-        while retry_count < MAX_RETRIES {
-            let fh_count = self.state.fh_to_path.lock().unwrap().len();
-            if fh_count == 0 {
-                info!("所有文件句柄已释放");
-                break;
-            }
-            
-            // 前几次重试时显示详细信息
-            if retry_count < 5 || retry_count % 10 == 0 {
-                info!("等待 {} 个文件句柄释放... (尝试 {}/{})", 
-                      fh_count, retry_count + 1, MAX_RETRIES);
-            }
-            
-            std::thread::sleep(std::time::Duration::from_millis(RETRY_INTERVAL_MS));
-            retry_count += 1;
-        }
-        
-        if retry_count >= MAX_RETRIES {
-            let remaining_fh = self.state.fh_to_path.lock().unwrap().len();
-            if remaining_fh > 0 {
-                warn!("等待文件句柄释放超时，仍有 {} 个句柄未释放", remaining_fh);
-                
-                // 强制清理剩余的文件句柄
-                let mut fh_to_path = self.state.fh_to_path.lock().unwrap();
-                warn!("强制清理 {} 个未释放的文件句柄", fh_to_path.len());
-                fh_to_path.clear();
-            }
-        }
-        
-        // 3. 清理 inode 映射表
-        {
-            let mut path_to_ino = self.state.path_to_ino.lock().unwrap();
-            let mut ino_to_path = self.state.ino_to_path.lock().unwrap();
-            info!("清理 inode 映射表（{} 个条目）", path_to_ino.len());
-            path_to_ino.clear();
-            ino_to_path.clear();
-        }
-        
-        info!("文件系统停止完成");
+        info!("rhss stop requested");
     }
+}
 
-    // 添加一个公共方法来委托给 state.is_running()
-    pub fn is_running(&self) -> bool {
-        self.state.is_running()
+fn errno(err: &FsError) -> libc::c_int {
+    match err {
+        FsError::Io(io) => io.raw_os_error().unwrap_or(EIO),
+        FsError::NotFound(_) => ENOENT,
+        FsError::PermissionDenied(_) => libc::EACCES,
+        FsError::InvalidOperation(_) => libc::EINVAL,
+        _ => EIO,
     }
 }
 
@@ -287,164 +304,75 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOSYS);
             return;
         }
-
-        let path = match self.state.get_path(parent, Some(name)) {
-            Some(p) => p,
-            None => {
-                error!("lookup: failed to get path for parent={}, name={:?}", parent, name);
-                reply.error(ENOENT);
-                return;
-            }
+        let Some(path) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
         };
-        debug!("lookup: {:?}", path);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.get_metadata(&path_clone).await {
-                Ok(metadata) => {
-                    let ino = state.allocate_ino(path_clone.clone());
-                    let attr = state.make_file_attr(
-                        ino,
-                        metadata.size,
-                        metadata.permissions,
-                        metadata.is_dir,
-                    );
-                    debug!("lookup: success for path={:?}, ino={}", path_clone, ino);
+        if self.state.config.should_ignore(&path) {
+            reply.error(ENOENT);
+            return;
+        }
+        debug!("lookup {}", path.display());
+
+        // Two possibilities: directory (resolved via filesystem walk on any
+        // backend) or file (must be in index).
+        if let Some((backend, bpath)) = self.state.resolve(&path) {
+            match backend.metadata(&bpath) {
+                Ok(meta) => {
+                    let ino = self.state.inodes.lock().allocate(path);
+                    let attr = self.state.make_attr(ino, &meta);
                     reply.entry(&TTL, &attr, 0);
                 }
-                Err(e) => {
-                    if state.config.should_ignore(&path_clone) {
-                        debug!("lookup: ignoring special path: {:?}", path_clone);
-                    } else {
-                        error!(
-                            parent_ino = parent,
-                            name = ?name,
-                            path = ?path_clone, 
-                            error = ?e, 
-                            "lookup error in fs.get_metadata"
-                        );
-                    }
-                    reply.error(ENOENT);
+                Err(e) => reply.error(errno(&e)),
+            }
+            return;
+        }
+
+        // Maybe it's a directory. Probe each fast backend's filesystem (P1
+        // simplification: directories aren't tracked in the index; they live on
+        // every backend that has anything below them).
+        for (_tier, backend) in self.state.router.all_backends() {
+            // Strip leading "/" since backend.metadata takes a relative path.
+            let rel = path.strip_prefix("/").unwrap_or(&path);
+            if let Ok(meta) = backend.metadata(rel) {
+                if meta.is_dir {
+                    let ino = self.state.inodes.lock().allocate(path);
+                    let attr = self.state.make_attr(ino, &meta);
+                    reply.entry(&TTL, &attr, 0);
+                    return;
                 }
             }
-        });
+        }
+        reply.error(ENOENT);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
-        if !self.state.running.load(Ordering::SeqCst) {
-            reply.error(ENOSYS);
-            return;
-        }
-        debug!("getattr: ino={}", ino);
         if ino == FUSE_ROOT_ID {
-            let attr = self.state.make_file_attr(ino, 0, 0o755, true);
-            reply.attr(&TTL, &attr);
+            reply.attr(&TTL, &self.state.root_attr());
+            return;
+        }
+        let Some(path) = self.state.inodes.lock().lookup_path(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        if let Some((backend, bpath)) = self.state.resolve(&path) {
+            match backend.metadata(&bpath) {
+                Ok(meta) => reply.attr(&TTL, &self.state.make_attr(ino, &meta)),
+                Err(e) => reply.error(errno(&e)),
+            }
             return;
         }
 
-        let path = match self.state.get_path(ino, None) {
-            Some(p) => p,
-            None => {
-                error!("getattr: failed to get path for ino={}", ino);
-                reply.error(ENOENT);
+        // Directory probe (same as lookup).
+        for (_tier, backend) in self.state.router.all_backends() {
+            let rel = path.strip_prefix("/").unwrap_or(&path);
+            if let Ok(meta) = backend.metadata(rel) {
+                reply.attr(&TTL, &self.state.make_attr(ino, &meta));
                 return;
             }
-        };
-
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.get_metadata(&path_clone).await {
-                Ok(metadata) => {
-                    let attr = state.make_file_attr(
-                        ino,
-                        metadata.size,
-                        metadata.permissions,
-                        metadata.is_dir,
-                    );
-                    debug!("getattr: success for path={:?}, ino={}", path_clone, ino);
-                    reply.attr(&TTL, &attr);
-                }
-                Err(e) => {
-                    error!("getattr error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOENT);
-                }
-            }
-        });
-    }
-
-    fn mkdir(
-        &mut self,
-        _req: &Request,
-        parent: u64,
-        name: &OsStr,
-        mode: u32,
-        _umask: u32,
-        reply: ReplyEntry,
-    ) {
-        let path = match self.state.get_path(parent, Some(name)) {
-            Some(p) => p,
-            None => {
-                error!("mkdir: failed to get path for parent={}, name={:?}", parent, name);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        debug!("mkdir: {:?}, mode={:o}", path, mode);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.create_directory(&path_clone).await {
-                Ok(()) => {
-                    let ino = state.allocate_ino(path_clone.clone());
-                    let attr = state.make_file_attr(ino, 0, mode, true);
-                    debug!("mkdir: success for path={:?}, ino={}", path_clone, ino);
-                    reply.entry(&TTL, &attr, 0);
-                }
-                Err(e) => {
-                    error!("mkdir error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
-                }
-            }
-        });
-    }
-
-    fn write(
-        &mut self,
-        _req: &Request,
-        _ino: u64,
-        fh: u64,
-        _offset: i64,
-        data: &[u8],
-        _write_flags: u32,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        reply: ReplyWrite,
-    ) {
-        let path = match self.state.get_path_from_fh(fh) {
-            Some(p) => p,
-            None => {
-                error!("write: failed to get path for fh={}", fh);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        debug!("write: {:?}, size={}", path, data.len());
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let data = data.to_vec();
-        let _result = self.run_async(async move {
-            match state.fs.write_file(&path_clone, &data).await {
-                Ok(()) => {
-                    debug!("write: success for path={:?}, size={}", path_clone, data.len());
-                    reply.written(data.len() as u32);
-                }
-                Err(e) => {
-                    error!("write error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOENT);
-                }
-            }
-        });
+        }
+        reply.error(ENOENT);
     }
 
     fn read(
@@ -458,162 +386,128 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let path = match self.state.get_path_from_fh(fh) {
-            Some(p) => p,
-            None => {
-                error!("read: failed to get path for fh={}", fh);
-                reply.error(ENOENT);
-                return;
-            }
+        let Some((backend, bpath, logical)) = self.state.fh(fh) else {
+            reply.error(ENOENT);
+            return;
         };
-        debug!("read: {:?}, offset={}, size={}", path, offset, size);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.read_file(&path_clone).await {
-                Ok(data) => {
-                    let start = offset as usize;
-                    let end = (offset as usize + size as usize).min(data.len());
-                    if start < data.len() {
-                        debug!("read: success for path={:?}, returning {} bytes", path_clone, end - start);
-                        reply.data(&data[start..end]);
-                    } else {
-                        warn!("read: offset {} beyond file size {} for path={:?}", start, data.len(), path_clone);
-                        reply.error(ENOENT);
-                    }
+        match backend.read_at(&bpath, offset as u64, size) {
+            Ok(data) => {
+                if let Some(t) = &self.state.access {
+                    t.record(logical, SystemTime::now());
                 }
-                Err(e) => {
-                    error!("read error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOENT);
-                }
+                reply.data(&data);
             }
-        });
+            Err(e) => {
+                error!("read {} offset={} size={}: {:?}", bpath.display(), offset, size, e);
+                reply.error(errno(&e));
+            }
+        }
     }
 
-    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        let path = match self.state.get_path(parent, Some(name)) {
-            Some(p) => p,
-            None => {
-                error!("unlink: failed to get path for parent={}, name={:?}", parent, name);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        debug!("unlink: {:?}", path);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.delete(&path_clone).await {
-                Ok(()) => {
-                    let mut path_to_ino = state.path_to_ino.lock().unwrap();
-                    let mut ino_to_path = state.ino_to_path.lock().unwrap();
-                    if let Some(ino) = path_to_ino.remove(&path_clone) {
-                        ino_to_path.remove(&ino);
-                        debug!("unlink: success for path={:?}, removed ino={}", path_clone, ino);
-                    } else {
-                        warn!("unlink: no inode found for path={:?}", path_clone);
-                    }
-                    reply.ok();
-                }
-                Err(e) => {
-                    error!("unlink error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
-                }
-            }
-        });
-    }
-
-    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: fuser::ReplyEmpty) {
-        let path = match self.state.get_path(parent, Some(name)) {
-            Some(p) => p,
-            None => {
-                error!("rmdir: failed to get path for parent={}, name={:?}", parent, name);
-                reply.error(ENOENT);
-                return;
-            }
-        };
-        debug!("rmdir: {:?}", path);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.delete(&path_clone).await {
-                Ok(()) => {
-                    let mut path_to_ino = state.path_to_ino.lock().unwrap();
-                    let mut ino_to_path = state.ino_to_path.lock().unwrap();
-                    if let Some(ino) = path_to_ino.remove(&path_clone) {
-                        ino_to_path.remove(&ino);
-                        debug!("rmdir: success for path={:?}, removed ino={}", path_clone, ino);
-                    } else {
-                        warn!("rmdir: no inode found for path={:?}", path_clone);
-                    }
-                    reply.ok();
-                }
-                Err(e) => {
-                    error!("rmdir error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
-                }
-            }
-        });
-    }
-
-    fn readdir(
+    fn write(
         &mut self,
         _req: &Request,
-        ino: u64,
-        _fh: u64,
+        _ino: u64,
+        fh: u64,
         offset: i64,
-        mut reply: ReplyDirectory,
+        data: &[u8],
+        _write_flags: u32,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        reply: ReplyWrite,
     ) {
-        let path = match self.state.get_path(ino, None) {
-            Some(p) => p,
-            None => {
-                error!("readdir: failed to get path for ino={}", ino);
-                reply.error(ENOENT);
-                return;
-            }
+        let Some((backend, bpath, logical)) = self.state.fh(fh) else {
+            reply.error(ENOENT);
+            return;
         };
-        debug!("readdir: {:?}, offset={}", path, offset);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.list_directory(&path_clone).await {
-                Ok(entries) => {
-                    let mut entries_vec = vec![
-                        (ino, FileType::Directory, ".".to_string()),
-                        (ino, FileType::Directory, "..".to_string()),
-                    ];
 
-                    for name in entries {
-                        let entry_path = path_clone.join(&name);
-                        let entry_ino = state.allocate_ino(entry_path.clone());
-                        let entry_type = match state.fs.get_metadata(&entry_path).await {
-                            Ok(metadata) => {
-                                if metadata.is_dir {
-                                    FileType::Directory
-                                } else {
-                                    FileType::RegularFile
-                                }
-                            }
-                            Err(_) => FileType::RegularFile,
-                        };
-                        debug!("readdir: found entry name={}, ino={}, type={:?}", name, entry_ino, entry_type);
-                        entries_vec.push((entry_ino, entry_type, name));
+        // ENOSPC retry loop (D8 / P3): try the write; if ENOSPC and
+        // automatic tiering is enabled, trigger an oneshot eviction, wait
+        // for it to complete (bounded), then retry. If automatic tiering
+        // is disabled (`tier_period < 0`, see D15), return ENOSPC straight
+        // away — no surprise multi-second blocking.
+        let mut attempts = 0u32;
+        loop {
+            match backend.write_at(&bpath, offset as u64, data) {
+                Ok(n) => {
+                    if let Some(t) = &self.state.access {
+                        t.record(logical, SystemTime::now());
                     }
-
-                    for (i, (entry_ino, entry_type, name)) in entries_vec.into_iter().enumerate().skip(offset as usize) {
-                        if reply.add(entry_ino, (i + 1) as i64, entry_type, &name) {
-                            break;
-                        }
-                    }
-                    debug!("readdir: success for path={:?}", path_clone);
-                    reply.ok();
+                    reply.written(n);
+                    return;
                 }
                 Err(e) => {
-                    error!("readdir error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
+                    let is_enospc = matches!(
+                        &e,
+                        FsError::Io(io) if io.raw_os_error() == Some(libc::ENOSPC)
+                    );
+                    if !is_enospc || attempts >= 1 || self.state.policy.tier_period().is_none() {
+                        if !is_enospc {
+                            error!(
+                                "write {} offset={} len={}: {:?}",
+                                bpath.display(),
+                                offset,
+                                data.len(),
+                                e
+                            );
+                        }
+                        reply.error(errno(&e));
+                        return;
+                    }
+                    attempts += 1;
+                    warn!(
+                        "write ENOSPC on {}; triggering emergency tiering",
+                        bpath.display()
+                    );
+                    if let Some(t) = &self.state.tierer {
+                        t.trigger_oneshot();
+                        let _ = t.wait_idle(Duration::from_secs(30));
+                    }
+                    // Loop and retry.
                 }
             }
+        }
+    }
+
+    fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
+        let Some(logical) = self.state.inodes.lock().lookup_path(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let Some((backend, bpath)) = self.state.resolve(&logical) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if let Err(e) = backend.exists(&bpath) {
+            reply.error(errno(&e));
+            return;
+        }
+        self.state.open_tracker.register(&logical);
+        let fh = self.state.allocate_fh(FhEntry {
+            logical: logical.clone(),
+            backend,
+            backend_path: bpath,
         });
+        if let Some(t) = &self.state.access {
+            t.record(logical, SystemTime::now());
+        }
+        reply.opened(fh, 0);
+    }
+
+    fn release(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _flags: i32,
+        _lock_owner: Option<u64>,
+        _flush: bool,
+        reply: ReplyEmpty,
+    ) {
+        if let Some(logical) = self.state.release_fh(fh) {
+            self.state.open_tracker.release(&logical);
+        }
+        reply.ok();
     }
 
     fn create(
@@ -626,79 +520,208 @@ impl Filesystem for FuseAdapter {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let path = match self.state.get_path(parent, Some(name)) {
-            Some(p) => p,
-            None => {
-                error!("create: failed to get path for parent={}, name={:?}", parent, name);
-                reply.error(ENOENT);
+        let Some(logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if self.state.config.should_ignore(&logical) {
+            reply.error(EEXIST);
+            return;
+        }
+
+        // Watermark routing (D6 / D17 / D20). When Fast is over panic, new
+        // files go directly to Slow so we don't hit ENOSPC on Fast.
+        let fast_usage = self.state.router.fast.usage_ratio();
+        let tier = self.state.policy.tier_for_create(fast_usage);
+        let backend = match self.state.router.tier(tier).pick() {
+            Ok(b) => Arc::clone(b),
+            Err(e) => {
+                reply.error(errno(&e));
                 return;
             }
         };
-        debug!("create: {:?}, mode={:o}", path, mode);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.create_file(&path_clone).await {
-                Ok(()) => {
-                    let ino = state.allocate_ino(path_clone.clone());
-                    let fh = state.allocate_fh(path_clone.clone());
-                    let attr = state.make_file_attr(ino, 0, mode, false);
-                    debug!("create: success for path={:?}, ino={}, fh={}", path_clone, ino, fh);
-                    reply.created(&TTL, &attr, 0, fh, 0);
-                }
-                Err(e) => {
-                    error!("create error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOSYS);
-                }
-            }
-        });
-    }
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
 
-    fn open(
-        &mut self,
-        _req: &Request,
-        _ino: u64,
-        _flags: i32,
-        reply: fuser::ReplyOpen,
-    ) {
-        let path = match self.state.get_path(_ino, None) {
-            Some(p) => p,
-            None => {
-                error!("open: failed to get path for ino={}", _ino);
-                reply.error(ENOENT);
+        if let Err(e) = backend.create_file(&rel) {
+            error!("create {}: {:?}", logical.display(), e);
+            reply.error(errno(&e));
+            return;
+        }
+        let _ = backend.set_permissions(&rel, mode);
+        let meta = match backend.metadata(&rel) {
+            Ok(m) => m,
+            Err(e) => {
+                reply.error(errno(&e));
                 return;
             }
         };
-        debug!("open: {:?}", path);
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
-        let _result = self.run_async(async move {
-            match state.fs.get_metadata(&path_clone).await {
-                Ok(_) => {
-                    let fh = state.allocate_fh(path_clone.clone());
-                    debug!("open: success for path={:?}, fh={}", path_clone, fh);
-                    reply.opened(fh, 0);  // flags=0
-                }
-                Err(e) => {
-                    error!("open error for path={:?}: {:?}", path_clone, e);
-                    reply.error(ENOENT);
-                }
-            }
+
+        let row = FileRow {
+            logical_path: logical.clone(),
+            location: Location {
+                tier,
+                backend_id: backend.id().to_string(),
+                backend_path: rel.clone(),
+                size: meta.size,
+            },
+            last_access: SystemTime::now(),
+            hit_count: 0,
+            popularity: self.state.policy.initial_popularity(), // D17
+            pinned_tier: None,
+            state: FileState::Stable,
+        };
+        if let Err(e) = self.state.index.insert(row) {
+            reply.error(errno(&e));
+            return;
+        }
+
+        let ino = self.state.inodes.lock().allocate(logical.clone());
+        self.state.open_tracker.register(&logical);
+        let fh = self.state.allocate_fh(FhEntry {
+            logical,
+            backend,
+            backend_path: rel,
         });
+        let attr = self.state.make_attr(ino, &meta);
+        reply.created(&TTL, &attr, 0, fh, 0);
     }
 
-    fn release(
+    fn mkdir(
         &mut self,
         _req: &Request,
-        _ino: u64,
-        fh: u64,
-        _flags: i32,
-        _lock_owner: Option<u64>,
-        _flush: bool,
-        reply: fuser::ReplyEmpty,
+        parent: u64,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+        reply: ReplyEntry,
     ) {
-        debug!("release: fh={}", fh);
-        self.state.release_fh(fh);
+        let Some(logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
+        // Create on EVERY backend so the dir is visible from anywhere.
+        let mut ok_meta: Option<BackendMeta> = None;
+        for (_tier, b) in self.state.router.all_backends() {
+            if let Err(e) = b.create_dir(&rel) {
+                warn!("mkdir on {}: {:?}", b.id(), e);
+            } else {
+                let _ = b.set_permissions(&rel, mode);
+                if ok_meta.is_none() {
+                    ok_meta = b.metadata(&rel).ok();
+                }
+            }
+        }
+        let Some(meta) = ok_meta else {
+            reply.error(EIO);
+            return;
+        };
+        let ino = self.state.inodes.lock().allocate(logical);
+        let attr = self.state.make_attr(ino, &meta);
+        reply.entry(&TTL, &attr, 0);
+    }
+
+    fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let Some((backend, bpath)) = self.state.resolve(&logical) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if let Err(e) = backend.remove(&bpath) {
+            reply.error(errno(&e));
+            return;
+        }
+        if let Err(e) = self.state.index.remove(&logical) {
+            warn!("index.remove {}: {:?}", logical.display(), e);
+        }
+        self.state.inodes.lock().remove(&logical);
+        reply.ok();
+    }
+
+    fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
+        let Some(logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
+        let mut last_err: Option<FsError> = None;
+        let mut removed_anywhere = false;
+        for (_tier, b) in self.state.router.all_backends() {
+            match b.remove(&rel) {
+                Ok(()) => removed_anywhere = true,
+                Err(e) => {
+                    last_err = Some(e);
+                }
+            }
+        }
+        if !removed_anywhere {
+            if let Some(e) = last_err {
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        self.state.inodes.lock().remove(&logical);
+        reply.ok();
+    }
+
+    fn readdir(
+        &mut self,
+        _req: &Request,
+        ino: u64,
+        _fh: u64,
+        offset: i64,
+        mut reply: ReplyDirectory,
+    ) {
+        let Some(dir_path) = self.state.inodes.lock().lookup_path(ino) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let rel = dir_path.strip_prefix("/").unwrap_or(&dir_path).to_path_buf();
+
+        // Merge entries from every backend into one logical view, deduping
+        // (same name across backends shows up once).
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut all: Vec<(u64, FileType, String)> = Vec::new();
+        all.push((ino, FileType::Directory, ".".to_string()));
+        all.push((ino, FileType::Directory, "..".to_string()));
+
+        for (_tier, b) in self.state.router.all_backends() {
+            let entries = match b.list_dir(&rel) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for name in entries {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let entry_path = dir_path.join(&name);
+                if self.state.config.should_ignore(&entry_path) {
+                    continue;
+                }
+                let entry_rel = entry_path.strip_prefix("/").unwrap_or(&entry_path).to_path_buf();
+                let kind = b
+                    .metadata(&entry_rel)
+                    .map(|m| {
+                        if m.is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        }
+                    })
+                    .unwrap_or(FileType::RegularFile);
+                let entry_ino = self.state.inodes.lock().allocate(entry_path);
+                all.push((entry_ino, kind, name));
+            }
+        }
+
+        for (i, (entry_ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
+            if reply.add(entry_ino, (i + 1) as i64, kind, &name) {
+                break;
+            }
+        }
         reply.ok();
     }
 
@@ -707,54 +730,194 @@ impl Filesystem for FuseAdapter {
         _req: &Request,
         ino: u64,
         mode: Option<u32>,
-        uid: Option<u32>,
-        gid: Option<u32>,
+        _uid: Option<u32>,
+        _gid: Option<u32>,
         size: Option<u64>,
-        atime: Option<fuser::TimeOrNow>,
-        mtime: Option<fuser::TimeOrNow>,
+        atime: Option<TimeOrNow>,
+        mtime: Option<TimeOrNow>,
         _ctime: Option<SystemTime>,
         fh: Option<u64>,
         _crtime: Option<SystemTime>,
         _chgtime: Option<SystemTime>,
         _bkuptime: Option<SystemTime>,
-        flags: Option<u32>,
+        _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        debug!(ino, ?mode, ?uid, ?gid, ?size, ?atime, ?mtime, ?fh, ?flags, "setattr called");
-
-        let path = match fh.and_then(|h| self.state.get_path_from_fh(h)) {
-            Some(p) => p,
-            None => match self.state.get_path(ino, None) {
-                Some(p) => p,
-                None => {
-                    error!("setattr: failed to get path for ino={}", ino);
-                    reply.error(libc::ENOENT);
+        let resolved = match fh.and_then(|h| self.state.fh(h)) {
+            Some((b, p, _)) => (b, p),
+            None => {
+                let Some(logical) = self.state.inodes.lock().lookup_path(ino) else {
+                    reply.error(ENOENT);
                     return;
-                }
+                };
+                let Some(r) = self.state.resolve(&logical) else {
+                    reply.error(ENOENT);
+                    return;
+                };
+                r
             }
         };
+        let (backend, bpath) = resolved;
 
-        let state = Arc::clone(&self.state);
-        let path_clone = path.clone();
+        if let Some(new_size) = size {
+            if let Err(e) = backend.truncate(&bpath, new_size) {
+                error!("truncate {}: {:?}", bpath.display(), e);
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        if let Some(new_mode) = mode {
+            if let Err(e) = backend.set_permissions(&bpath, new_mode) {
+                warn!("chmod {}: {:?}", bpath.display(), e);
+            }
+        }
+        if atime.is_some() || mtime.is_some() {
+            let at = atime.map(|t| match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            });
+            let mt = mtime.map(|t| match t {
+                TimeOrNow::SpecificTime(t) => t,
+                TimeOrNow::Now => SystemTime::now(),
+            });
+            if let Err(e) = backend.set_times(&bpath, at, mt) {
+                warn!("utimes {}: {:?}", bpath.display(), e);
+            }
+        }
 
-        let _result = self.run_async(async move {
-            match state.fs.get_metadata(&path_clone).await {
-                Ok(metadata) => {
-                    // 完全忽略 setattr 请求的参数，仅返回当前获取的元数据
-                    let attr = state.make_file_attr(
-                        ino,
-                        metadata.size,
-                        metadata.permissions,
-                        metadata.is_dir,
-                    );
-                    debug!("setattr: replying with UNMODIFIED attrs for path={:?}, ino={}", path_clone, ino);
-                    reply.attr(&TTL, &attr);
-                }
-                Err(e) => {
-                    error!("setattr: getattr error for path={:?}: {:?}", path_clone, e);
-                    reply.error(libc::ENOENT);
+        match backend.metadata(&bpath) {
+            Ok(meta) => reply.attr(&TTL, &self.state.make_attr(ino, &meta)),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(from_logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let Some(to_logical) = self.state.path_for(new_parent, new_name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        // Look up the file's current backend via the index.
+        let Some(row) = self.state.index.get(&from_logical).ok().flatten() else {
+            // Maybe it's a directory — rename across all backends.
+            let mut ok = false;
+            for (_tier, b) in self.state.router.all_backends() {
+                let from_rel = from_logical.strip_prefix("/").unwrap_or(&from_logical);
+                let to_rel = to_logical.strip_prefix("/").unwrap_or(&to_logical);
+                if b.rename(from_rel, to_rel).is_ok() {
+                    ok = true;
                 }
             }
-        });
+            if ok {
+                self.state.inodes.lock().rename(&from_logical, to_logical);
+                reply.ok();
+            } else {
+                reply.error(ENOENT);
+            }
+            return;
+        };
+
+        let backend = match self.state.router.resolve_backend(row.location.tier, &row.location.backend_id) {
+            Some(b) => Arc::clone(b),
+            None => {
+                reply.error(EIO);
+                return;
+            }
+        };
+        let from_rel = row.location.backend_path.clone();
+        let to_rel = to_logical
+            .strip_prefix("/")
+            .unwrap_or(&to_logical)
+            .to_path_buf();
+
+        if let Err(e) = backend.rename(&from_rel, &to_rel) {
+            // Same-backend rename failed. Cross-backend / cross-tier rename
+            // would be migrate-driven; not handled here (file would need to
+            // be copied first). For v0.1 we just surface the error.
+            reply.error(errno(&e));
+            return;
+        }
+        if let Err(e) = self.state.index.rename(&from_logical, &to_logical) {
+            warn!("index.rename {} -> {}: {:?}", from_logical.display(), to_logical.display(), e);
+        }
+        // Also update the backend_path in the index since the file moved
+        // within the backend's directory tree.
+        let new_loc = Location {
+            tier: row.location.tier,
+            backend_id: row.location.backend_id.clone(),
+            backend_path: to_rel,
+            size: row.location.size,
+        };
+        let _ = self.state.index.swap_location(&to_logical, new_loc);
+        self.state.inodes.lock().rename(&from_logical, to_logical);
+        reply.ok();
     }
-} 
+
+    fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {
+        // FUSE forget is advisory; we keep a flat inode map and don't grow
+        // an explicit lookup_count. For long-running mounts this means the
+        // inode map grows monotonically — to be addressed in v0.2 (issue
+        // tracked in risks.md).
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some((backend, bpath, _)) = self.state.fh(fh) else {
+            reply.error(ENOENT);
+            return;
+        };
+        match backend.fsync(&bpath) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        // Mac apps frequently call close()/flush. fsync is the safer thing
+        // to do; F_FULLFSYNC is reserved for the migrate path (D4 P3).
+        let Some((backend, bpath, _)) = self.state.fh(fh) else {
+            reply.ok();
+            return;
+        };
+        let _ = backend.fsync(&bpath);
+        reply.ok();
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let (fast_total, _fast_used, fast_free) = self.state.router.fast.capacity();
+        let (slow_total, _slow_used, slow_free) = self.state.router.slow.capacity();
+        let total = fast_total + slow_total;
+        let free = fast_free + slow_free;
+        let bsize = 4096u32;
+        let blocks = total / bsize as u64;
+        let bfree = free / bsize as u64;
+        let files = self.state.index.count().unwrap_or(0);
+        reply.statfs(blocks, bfree, bfree, files, 0, bsize, 255, bsize);
+    }
+}

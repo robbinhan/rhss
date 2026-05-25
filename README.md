@@ -1,113 +1,126 @@
-# RHSS - Rust Hybrid Storage System
+# RHSS — Rust Hybrid Storage System
 
-一个基于 FUSE 的混合存储文件系统，支持根据文件大小自动分配到热存储（SSD）或冷存储（HDD）。
+A FUSE filesystem that combines multiple physical disks into one mount point
+and automatically keeps **hot data on fast tiers (SSD) and cold data on slow
+tiers (HDD)** based on access patterns — not file size.
 
-## 功能特性
+> Status: **v2.3 refactor**(`refactor/sync-lru-v2`branch),
+> phases P0 → P4 implemented. Full plan in [`docs/plan/`](docs/plan/README.md).
 
-- ✅ **安全退出机制**：支持多种信号（Ctrl+C, SIGTERM, SIGHUP），优雅关闭并清理资源
-- 🔄 基于文件大小阈值的自动存储分层
-- 🚀 支持 Tokio 和 Rustix 两种存储后端
-- 📁 FUSE 文件系统接口，透明访问
+## What rhss is for
 
-## TODO
-- [x] 安全退出程序
-  - 支持多种终止信号（Ctrl+C, SIGTERM, SIGHUP）
-  - 优雅关闭文件句柄和清理资源
-  - 超时机制防止挂起
-  - 详细的退出日志和错误处理
-- [x] benchmark测试（fuse和posix两种）
-  - 完整的性能基准测试套件
-  - 支持 Tokio 和 Rustix 两种存储后端
-  - 测试小文件和大文件的读写性能
-  - 自动对比两种后端的性能差异
-  - 彩色输出显示性能对比结果
-- [x] 程序启动后应该给hot和cold存储加锁，不允许其他程序访问
-  - 实现了基于文件的锁机制
-  - 锁文件包含进程PID、主机名、创建时间等信息
-  - 自动检测并清理过期锁（进程已退出）
-  - 支持 --force 参数强制获取锁
-  - 程序退出时自动释放锁
-  - **文件系统级别权限控制（方案一）**
-    - 获取锁时自动将存储目录权限设置为 700（仅所有者可访问）
-    - 防止其他用户/进程直接访问存储目录
-    - 程序退出时自动恢复原始权限
-  - **隐藏存储模式（方案三）**
-    - 使用 --hidden-storage 参数启用
-    - 将实际存储移到系统临时目录的隐藏位置
-    - 原始目录设为只读，防止直接访问
-    - 所有操作只能通过 FUSE 挂载点进行
-    - 程序退出时自动同步内容回原始位置并清理隐藏目录
-- [x] 添加文件位置缓存：记录每个文件实际所在的存储层，避免每次都要尝试两个存储
-  - 实现了高性能的内存缓存机制
-  - TTL（生存时间）：5分钟，自动过期清理
-  - 最大容量：10000个条目，LRU淘汰策略
-  - 缓存命中时直接从已知位置读取，避免搜索
-  - 支持批量更新（目录列表时）
-  - 文件操作时自动更新缓存（写入、删除）
-  - 缓存统计信息：可查看命中率和分布情况
-- [x] 文件迁移机制：当检测到文件位置与阈值规则不符时，自动迁移文件到正确的存储层
-  - 自动检测文件位置是否符合大小阈值规则
-  - 支持单文件迁移和批量目录迁移
-  - 写入文件时自动迁移到正确存储层
-  - 提供独立的迁移工具 (`cargo run --bin migrate`)
-  - 迁移后自动更新缓存位置信息
-  - 支持全存储扫描和修正
+You have a few physical disks: small/fast SSDs and large/slow HDDs. You want
+applications to see **one unified directory** while rhss transparently keeps
+files you're actually using on SSD and demotes the long-cold ones to HDD.
 
-## 测试
+That's exactly what rhss does:
 
-### 运行安全退出测试
-```bash
-./test_shutdown.sh
+- One FUSE mount point, multi-disk underneath
+- Tier by **access popularity** (EMA score, autotier-style — 5 years of
+  production validation behind that formula)
+- Multi-disk per tier (`Vec<Backend>` + placement strategy)
+- SQLite path index (lookup what's where, persistent across restarts)
+- Background tierer that evicts cold files when SSD passes 60% usage
+- Three-watermark write routing (60% / 85% / 95%) — new files start on SSD,
+  but when SSD passes 95% they go straight to HDD to avoid ENOSPC blocking
+
+## What rhss is **not** for
+
+- High-IOPS databases (MySQL/Postgres/Kafka data dirs) — FUSE has a context
+  switch per call; we can't beat native filesystems on small random IO
+- Multi-machine HA / distributed clusters
+- Strict POSIX features that depend on kernel-level mandatory locking or
+  xattr-heavy workloads (xattr support is on the roadmap)
+
+See [`docs/plan/performance.md`](docs/plan/performance.md) §5 for the full
+non-goals list.
+
+## Platform support
+
+| Platform | Status | Expected sequential throughput |
+|---|---|---|
+| macOS (macFUSE) | ✅ primary target | 200-500 MB/s |
+| Linux (FUSE3) | ✅ 1st-class | 1-2 GB/s with v2.3 mount opts (more via P3.5.2/3 once fuser exposes splice) |
+| Windows | ❌ out of scope | (use WSL2) |
+
+## Quick start
+
+1. Install [macFUSE](https://osxfuse.github.io/) (macOS) or `libfuse3` (Linux).
+2. Prepare a `.rhss_managed/` subdirectory on each disk you want rhss to
+   manage. Move data into them — that's how rhss adopts existing data without
+   moving it (see [`docs/plan/architecture.md`](docs/plan/architecture.md) §4.11):
+   ```bash
+   mkdir /Volumes/SSD_256G/.rhss_managed
+   mkdir /Volumes/HDD_4T/.rhss_managed
+   mv ~/Movies/* /Volumes/HDD_4T/.rhss_managed/
+   ```
+3. Write a config file `rhss.toml`:
+   ```toml
+   mount = "/mnt/rhss"
+   db = "/var/lib/rhss/index.db"
+
+   [[tier.fast]]
+   id = "ssd-256"
+   root = "/Volumes/SSD_256G/.rhss_managed"
+
+   [[tier.slow]]
+   id = "hdd-4t"
+   root = "/Volumes/HDD_4T/.rhss_managed"
+   ```
+4. Mount:
+   ```bash
+   cargo run --release -- --config rhss.toml
+   ```
+5. Use the mount point like any other directory. Sleep at night and rhss will
+   keep hot data on SSD.
+
+## Architecture
+
+```
+       FUSE mount point
+              │
+       ┌──────┴──────┐
+       │ FuseAdapter │
+       └──┬───────┬──┘
+          │       │
+   PathIndex   TierRouter
+   (SQLite)   ┌────┴────┐
+              │         │
+        Fast Tier   Slow Tier
+        Vec<SSD>    Vec<HDD>
 ```
 
-### 测试存储锁和权限控制
+Background tierer wakes every 10 minutes (configurable), checks SSD usage,
+evicts the **coldest** files (skipping any currently open) to make room.
+
+Full architecture in [`docs/plan/architecture.md`](docs/plan/architecture.md).
+
+## Building from source
+
 ```bash
-# 测试基本锁机制
-./test_lock.sh
-
-# 测试权限控制功能（方案一）
-./test_permissions.sh
-
-# 测试隐藏存储模式（方案三）
-./test_hidden_storage.sh
-
-# 测试文件位置缓存
-./test_cache.sh
-
-# 测试文件迁移机制
-./test_migration.sh
+git clone <this repo>
+cd rhss
+cargo build --release
+cargo test --lib
 ```
 
-### 运行性能基准测试
-```bash
-# 测试两种存储后端
-cargo run --release --bin benchmark -- -H test/hot -C test/cold
+36 unit tests cover the Backend trait, PathIndex, EMA scoring, placement,
+migration, ENOSPC retry, and config parsing.
 
-# 只测试 Tokio 后端
-cargo run --release --bin benchmark -- -H test/hot -C test/cold --mode tokio
+## Documentation
 
-# 自定义测试参数
-cargo run --release --bin benchmark -- \
-  -H test/hot \
-  -C test/cold \
-  -n 100 \                    # 测试文件数量
-  --small-size 1024 \         # 小文件大小（字节）
-  --large-size 10485760 \     # 大文件大小（字节）
-  -t 1048576                  # 阈值（字节）
-```
+| Doc | What |
+|---|---|
+| [`docs/plan/README.md`](docs/plan/README.md) | Top-level plan index + timeline |
+| [`docs/plan/decisions.md`](docs/plan/decisions.md) | D1-D21 design decisions (frozen reference) |
+| [`docs/plan/architecture.md`](docs/plan/architecture.md) | Full target architecture |
+| [`docs/plan/performance.md`](docs/plan/performance.md) | Blocking analysis + expectations + platform matrix |
+| [`docs/plan/testing.md`](docs/plan/testing.md) | Test strategy |
+| [`docs/plan/risks.md`](docs/plan/risks.md) | Risks + open questions |
+| [`docs/plan/glossary.md`](docs/plan/glossary.md) | Plain-Chinese term reference |
+| [`docs/plan/CHANGELOG.md`](docs/plan/CHANGELOG.md) | v1 → v2.3 evolution |
+| [`docs/plan/phases/`](docs/plan/phases/) | Per-phase task lists + acceptance |
 
-### 运行文件迁移工具
-```bash
-# 迁移单个文件
-cargo run --bin migrate -- -H test/hot -C test/cold -t 1048576 -p path/to/file
+## License
 
-# 扫描并迁移整个存储
-cargo run --bin migrate -- -H test/hot -C test/cold -t 1048576 -a
-```
-
-## 性能测试结果示例
-
-从基准测试可以看出：
-- **Rustix 在读取操作上更快**：小文件读取快 60.8%，大文件读取快 56.3%
-- **Tokio 在写入操作上更快**：小文件写入快 27.9%，大文件写入快 47.9%
-- 两种后端各有优势，可根据实际使用场景选择
+(unspecified — adopt one before shipping)

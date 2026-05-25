@@ -3,31 +3,25 @@ name = "rhss"
 version = "0.1.0"
 edition = "2021"
 
-[[bin]]
-name = "benchmark"
-path = "src/bin/benchmark.rs"
-
-[[bin]]
-name = "migrate"
-path = "src/bin/migrate.rs"
-
 [dependencies]
-tokio = { version = "1.36", features = ["full"] }
-async-trait = "0.1.77"
-futures = "0.3.30"
 thiserror = "1.0.57"
 anyhow = "1.0.80"
 tracing = "0.1.40"
 tracing-subscriber = { version = "0.3.18", features = ["env-filter"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
-chrono = { version = "0.4", features = ["serde"] }
-uuid = { version = "1.7", features = ["v4", "serde"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-native-tls", "postgres", "chrono"] }
 fuser = "0.15.1"
 libc = "0.2.153"
 rustix = { version = "1.0", features = ["fs", "process", "time", "system"] }
 clap = { version = "4.5", features = ["derive"] }
-ctrlc = "3.4.2"
+ctrlc = { version = "3.4.2", features = ["termination"] }
 whoami = "1.5"
-tempfile = "3.8" 
+parking_lot = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
+lru = "0.12"
+toml = "0.8"
+walkdir = "2.5"
+crossbeam-channel = "0.5"
+
+[dev-dependencies]
+tempfile = "3.8"
