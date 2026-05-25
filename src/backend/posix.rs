@@ -64,6 +64,7 @@ impl Backend for PosixBackend {
         let f = OpenOptions::new()
             .write(true)
             .create(true)
+            .truncate(false)
             .open(self.full(path))?;
         let n = f.write_at(data, offset)?;
         Ok(n as u32)

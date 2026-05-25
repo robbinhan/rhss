@@ -79,7 +79,7 @@ impl StorageLock {
                     let lock_info = LockInfo {
                         pid: process::id(),
                         start_time: get_process_start_time(),
-                        hostname: whoami::hostname(),
+                        hostname: whoami::fallible::hostname().unwrap_or_else(|_| "unknown".into()),
                         created_at: SystemTime::now()
                             .duration_since(UNIX_EPOCH)
                             .unwrap()

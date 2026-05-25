@@ -1,109 +1,119 @@
-# RHSS (Rust Hybrid Storage System) 功能总结
+# Features
 
-## ✅ 已完成的功能
+> Up-to-date as of the v2.3 refactor (P0-P4 implemented). The pre-refactor
+> "hidden-storage" and "size-based routing" features are **removed**; see
+> [`docs/plan/CHANGELOG.md`](docs/plan/CHANGELOG.md) for the evolution.
 
-### 1. 安全退出程序机制
-- 捕获 Ctrl+C (SIGINT)、SIGTERM 和 SIGHUP 信号
-- 优雅地停止文件系统操作
-- 自动卸载 FUSE 挂载点
-- 释放所有资源（存储锁、文件句柄等）
-- macOS 特殊处理（diskutil unmount）
+## Storage
 
-### 2. Benchmark 性能测试
-- 支持 Tokio (async) 和 Rustix (POSIX) 两种后端
-- 测试项目：
-  - 小文件/大文件读写性能
-  - 目录列表操作
-  - 元数据获取
-  - 文件删除操作
-- 自动对比两种后端的性能差异
-- 可自定义测试参数（文件数量、大小、阈值等）
+- **Sync `Backend` trait with positional IO** (`pread`/`pwrite`) — no async
+  overhead, no whole-file reads. Replaces v1's broken async layer.
+- **Multi-disk per tier** (`Vec<Backend>` + placement strategy) — rhss
+  manages disk combination itself (no underlying RAID/APFS Container).
+  MVP placement = "most free space wins".
+- **POSIX backend** (`PosixBackend`) — the only backend impl in v2.3.
+  Trait abstraction reserves room for future S3/network backends.
+- **`F_FULLFSYNC` on macOS** for the migrate path's persistence point.
+  Plain `fsync` is used elsewhere to keep latency low.
 
-### 3. 存储加锁机制
-- 防止多个进程同时访问同一存储目录
-- 基于文件的分布式锁实现
-- 锁文件包含：PID、主机名、启动时间、版本信息
-- 支持强制模式（--force）清理过期锁
-- 进程退出时自动释放锁
+## Tiering
 
-### 4. 目录访问控制（两种方案）
-#### 方案一：权限控制
-- 获取锁时自动设置目录权限为 700（仅所有者可访问）
-- 释放锁时恢复原始权限
-- 防止其他用户/进程直接访问存储目录
+- **Two-tier model** (Fast / Slow). Names are physical, not policy —
+  tier-for-file is decided by access popularity (EMA), not by file size.
+- **EMA popularity scoring** (autotier formula, 5-year production-validated):
+  `y[n] = MULTIPLIER * x / DAMPING + (1 − 1/DAMPING) * y[n−1]`, where
+  `DAMPING` ramps 50 000 → 1 000 000 over a week.
+- **Three watermarks** (60% / 85% / 95% — D6):
+  - Below 60%: tierer idle.
+  - 60%-85%: tierer evicts coldest files periodically.
+  - Above 95%: new files routed straight to Slow (panic_watermark).
+- **`min_age_to_evict = 300s`** — anti-thrashing. Files just created can't
+  be immediately demoted.
+- **Daily full-sweep** — periodic correction pass for long-term drift.
+- **`tier_period = -1` = pure manual mode** (D15) — useful in tests and ops.
 
-#### 方案二：隐藏存储
-- 使用 --hidden-storage 参数启用
-- 将实际存储移到系统临时目录的隐藏位置
-- 原始目录设为只读（500）
-- 程序退出时自动同步内容并清理
+## Path Index
 
-### 5. 文件位置缓存机制
-- 高性能内存缓存，记录文件实际存储位置
-- TTL（生存时间）：5分钟自动过期
-- 最大容量：10000个条目，LRU淘汰策略
-- 缓存操作：
-  - 读取时：缓存命中直接返回，未命中则搜索并更新
-  - 写入时：自动更新缓存位置
-  - 删除时：清理缓存条目
-  - 列目录时：批量更新缓存
-- 缓存统计：可查看命中率和分布情况
+- **SQLite (WAL) + in-memory LRU cache** for the hot lookup path.
+- **Persistence across restarts** — file routing survives a remount.
+- **First-scan ingestion** — on first mount with an empty index, walks each
+  backend's `.rhss_managed/` subdirectory and registers each file. Mtime
+  becomes the initial `last_access` (D17). Cross-backend conflicts (same
+  logical path on two backends) **hard-fail** the mount so the user can
+  disambiguate manually.
+- **Trait abstraction** (`PathIndex`) — D18 reserves the option to switch
+  to sled / redb if SQLite becomes a bottleneck.
 
-### 6. 文件迁移机制
-- 自动检测文件位置是否符合大小阈值规则
-- 写入文件时自动迁移到正确存储层
-- 独立迁移工具支持：
-  - 单文件迁移
-  - 目录批量迁移
-  - 全存储扫描和修正
-- 迁移后自动更新缓存
-- 详细的迁移日志和统计
+## FUSE
 
-## 📊 性能优化成果
+- **Offset-aware `read` / `write`** — large file IO no longer corrupts data.
+- **Multi-threaded dispatch** (`spawn_mount2`) — one slow HDD seek doesn't
+  block the whole mount.
+- **Real `setattr`** — `truncate` / `chmod` / `utimes` actually apply.
+- **`rename`** — same-backend path moves go through `backend.rename`.
+- **`statfs`** — aggregates total/free across every backend in every tier.
+- **`fsync` / `flush`** — wired to `Backend::fsync` (uses `F_FULLFSYNC` on
+  macOS for the migrate persistence point).
+- **`ENOSPC` retry loop** — when a write hits ENOSPC and auto-tiering is on,
+  triggers an oneshot eviction, waits for it (≤ 30s), retries the write.
+  When auto-tiering is off, returns ENOSPC immediately (no surprise blocking).
 
-### 缓存带来的性能提升
-- 减少 I/O 操作：缓存命中时避免文件系统搜索
-- 降低延迟：内存访问比磁盘快 1000+ 倍
-- 提高吞吐量：批量操作减少缓存更新开销
+## Skip-Open-Files Migration
 
-### 存储后端对比
-- **Rustix 优势**：读取操作更快（小文件快 60.8%，大文件快 56.3%）
-- **Tokio 优势**：写入操作更快（小文件快 27.9%，大文件快 47.9%）
+- **No RCU.** Tierer queries `OpenFileTracker` before migrating; files
+  currently open are skipped and retried next cycle. Replaces v2's
+  over-engineered RCU plan.
+- **Atime / mtime preserved across migration** (D16) — backups and rsync
+  tools don't see "everything changed" after a tier cycle.
+- **Pin field on every file** (`pinned_tier`) — DB schema is ready; CLI
+  command is on the roadmap.
 
-## 🛠️ 使用工具
+## Configuration
 
-### 主程序
-```bash
-cargo run --bin rhss -- -m mount_point -H hot_dir -C cold_dir -t threshold
-```
+- **TOML config**: `mount`, `db`, and `[[tier.fast]]` / `[[tier.slow]]`
+  arrays of `{id, root}`.
+- **Validation**: duplicate backend IDs and empty tiers are rejected.
 
-### 性能测试
-```bash
-cargo run --release --bin benchmark -- -H hot_dir -C cold_dir
-```
+## Platform support
 
-### 文件迁移
-```bash
-# 单文件
-cargo run --bin migrate -- -H hot_dir -C cold_dir -t threshold -p file_path
+| Platform | Status | Notes |
+|---|---|---|
+| macOS | ✅ primary | macFUSE required |
+| Linux | ✅ 1st-class | FUSE3, mount opts tuned for throughput |
+| Windows | ❌ out of scope | WSL2 works |
 
-# 全存储
-cargo run --bin migrate -- -H hot_dir -C cold_dir -t threshold -a
-```
+## Process management
 
-## 🔒 安全性保障
+- **Process lock**: `~/.rhss_lock` style file prevents two rhss processes
+  from mounting the same backend tree concurrently. `--force` clears stale
+  locks.
+- **Signal handling** via `ctrlc` crate (SIGINT/SIGTERM/SIGHUP) — graceful
+  unmount + lock release.
 
-1. **进程级锁**：防止数据竞争和损坏
-2. **权限控制**：限制未授权访问
-3. **优雅退出**：确保数据一致性
-4. **自动清理**：防止资源泄露
-5. **错误恢复**：强制模式处理异常状态
+## Removed in v2.3 (vs v1)
 
-## 🚀 未来可能的改进
+- ❌ `--hidden-storage` flag and all its plumbing (would store data in `/tmp`
+  with no durability — see D9)
+- ❌ Whole-file `read_file` / `write_file` (the data-corruption root cause)
+- ❌ async-trait / Tokio runtime (replaced by sync `Backend`)
+- ❌ Size-based tier routing (`StorageTier::Warm` and the threshold flag)
+- ❌ Postgres / sqlx dependency (never used in earnest)
+- ❌ Single-char filename ignore rule (rejected legitimate files)
+- ❌ benchmark / migrate binaries (subsumed by `cargo test` and tierer's
+  oneshot path)
 
-1. **分布式锁**：支持网络文件系统
-2. **压缩存储**：冷数据自动压缩
-3. **加密支持**：敏感数据加密存储
-4. **智能预取**：基于访问模式的预测性缓存
-5. **监控面板**：实时性能和状态监控
-6. **自动调优**：基于负载的阈值动态调整
+## Test coverage
+
+- **36 unit tests** covering Backend, PathIndex, placement, EMA,
+  OpenFileTracker, migrate, config, and scan.
+- Integration tests (real FUSE mount) live in `tests/integration/` and must
+  be run locally with macFUSE installed; CI on Linux runners is on the
+  P3.5.6 roadmap.
+
+## Roadmap (post-v2.3)
+
+- v0.2: `pin` / `unpin` CLI; `xattr` support (needed for MinIO integration);
+  full FUSE3 splice path on Linux (FuseBufVec + writeback cache) to reach
+  3 GB/s sequential.
+- v0.3: Linux CI perf baseline (D21 enforcement); evaluate switching
+  `PathIndex` to sled if SQLite shows as a bottleneck (D18).

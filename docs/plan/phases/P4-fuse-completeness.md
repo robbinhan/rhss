@@ -39,4 +39,11 @@ D9(移除 `--hidden-storage`)。
 
 ## 状态
 
-⏳ 未开始(等 P3,P3.5 可选)
+✅ 完成 (2026-05-25)
+
+- FUSE rename / forget / fsync / flush 实现
+- whoami 弃用 API 替换为 fallible::hostname()
+- README.md 和 FEATURES.md 整体重写,反映 v2.3 架构
+- cargo build / cargo test --lib / cargo clippy -- -D warnings 全部通过零警告
+- 36 个单元测试通过
+- 实际挂载 mv / 24h 长跑测试待手工验证

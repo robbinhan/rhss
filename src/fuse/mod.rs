@@ -140,7 +140,7 @@ impl FuseState {
         FileAttr {
             ino,
             size: meta.size,
-            blocks: (meta.size + 511) / 512,
+            blocks: meta.size.div_ceil(512),
             atime: meta.atime,
             mtime: meta.mtime,
             ctime: meta.ctime,
@@ -271,7 +271,13 @@ impl FuseAdapter {
         }
         #[cfg(target_os = "linux")]
         {
+            // D20 / D21 — Linux perf path. macFUSE doesn't support any of
+            // these; the cfg gate is essential.
             opts.push(MountOption::AllowOther);
+            opts.push(MountOption::CUSTOM("max_read=1048576".to_string()));   // 1 MiB
+            opts.push(MountOption::CUSTOM("max_write=1048576".to_string()));  // 1 MiB
+            opts.push(MountOption::CUSTOM("max_background=16".to_string()));
+            opts.push(MountOption::CUSTOM("congestion_threshold=12".to_string()));
         }
         opts
     }
@@ -783,6 +789,124 @@ impl Filesystem for FuseAdapter {
             Ok(meta) => reply.attr(&TTL, &self.state.make_attr(ino, &meta)),
             Err(e) => reply.error(errno(&e)),
         }
+    }
+
+    fn rename(
+        &mut self,
+        _req: &Request,
+        parent: u64,
+        name: &OsStr,
+        new_parent: u64,
+        new_name: &OsStr,
+        _flags: u32,
+        reply: ReplyEmpty,
+    ) {
+        let Some(from_logical) = self.state.path_for(parent, name) else {
+            reply.error(ENOENT);
+            return;
+        };
+        let Some(to_logical) = self.state.path_for(new_parent, new_name) else {
+            reply.error(ENOENT);
+            return;
+        };
+
+        // Look up the file's current backend via the index.
+        let Some(row) = self.state.index.get(&from_logical).ok().flatten() else {
+            // Maybe it's a directory — rename across all backends.
+            let mut ok = false;
+            for (_tier, b) in self.state.router.all_backends() {
+                let from_rel = from_logical.strip_prefix("/").unwrap_or(&from_logical);
+                let to_rel = to_logical.strip_prefix("/").unwrap_or(&to_logical);
+                if b.rename(from_rel, to_rel).is_ok() {
+                    ok = true;
+                }
+            }
+            if ok {
+                self.state.inodes.lock().rename(&from_logical, to_logical);
+                reply.ok();
+            } else {
+                reply.error(ENOENT);
+            }
+            return;
+        };
+
+        let backend = match self.state.router.resolve_backend(row.location.tier, &row.location.backend_id) {
+            Some(b) => Arc::clone(b),
+            None => {
+                reply.error(EIO);
+                return;
+            }
+        };
+        let from_rel = row.location.backend_path.clone();
+        let to_rel = to_logical
+            .strip_prefix("/")
+            .unwrap_or(&to_logical)
+            .to_path_buf();
+
+        if let Err(e) = backend.rename(&from_rel, &to_rel) {
+            // Same-backend rename failed. Cross-backend / cross-tier rename
+            // would be migrate-driven; not handled here (file would need to
+            // be copied first). For v0.1 we just surface the error.
+            reply.error(errno(&e));
+            return;
+        }
+        if let Err(e) = self.state.index.rename(&from_logical, &to_logical) {
+            warn!("index.rename {} -> {}: {:?}", from_logical.display(), to_logical.display(), e);
+        }
+        // Also update the backend_path in the index since the file moved
+        // within the backend's directory tree.
+        let new_loc = Location {
+            tier: row.location.tier,
+            backend_id: row.location.backend_id.clone(),
+            backend_path: to_rel,
+            size: row.location.size,
+        };
+        let _ = self.state.index.swap_location(&to_logical, new_loc);
+        self.state.inodes.lock().rename(&from_logical, to_logical);
+        reply.ok();
+    }
+
+    fn forget(&mut self, _req: &Request, _ino: u64, _nlookup: u64) {
+        // FUSE forget is advisory; we keep a flat inode map and don't grow
+        // an explicit lookup_count. For long-running mounts this means the
+        // inode map grows monotonically — to be addressed in v0.2 (issue
+        // tracked in risks.md).
+    }
+
+    fn fsync(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _datasync: bool,
+        reply: ReplyEmpty,
+    ) {
+        let Some((backend, bpath, _)) = self.state.fh(fh) else {
+            reply.error(ENOENT);
+            return;
+        };
+        match backend.fsync(&bpath) {
+            Ok(()) => reply.ok(),
+            Err(e) => reply.error(errno(&e)),
+        }
+    }
+
+    fn flush(
+        &mut self,
+        _req: &Request,
+        _ino: u64,
+        fh: u64,
+        _lock_owner: u64,
+        reply: ReplyEmpty,
+    ) {
+        // Mac apps frequently call close()/flush. fsync is the safer thing
+        // to do; F_FULLFSYNC is reserved for the migrate path (D4 P3).
+        let Some((backend, bpath, _)) = self.state.fh(fh) else {
+            reply.ok();
+            return;
+        };
+        let _ = backend.fsync(&bpath);
+        reply.ok();
     }
 
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
