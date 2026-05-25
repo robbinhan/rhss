@@ -150,7 +150,7 @@ fn main() {
     let open_tracker = Arc::new(OpenFileTracker::new());
     let policy: Arc<dyn TieringPolicy> = Arc::new(PopularityPolicy::default());
 
-    let (_tierer, _tierer_handle) = Tierer::spawn(
+    let (_tierer, tierer_handle) = Tierer::spawn(
         Arc::clone(&router),
         Arc::clone(&index),
         Arc::clone(&open_tracker),
@@ -163,6 +163,7 @@ fn main() {
         Arc::clone(&index),
         Arc::clone(&policy),
         Arc::clone(&open_tracker),
+        Some(tierer_handle),
         Some(access),
         FuseConfig::default(),
     );

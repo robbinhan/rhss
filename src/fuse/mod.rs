@@ -26,7 +26,7 @@ use crate::error::FsError;
 use crate::index::{FileRow, FileState, Location, PathIndex};
 use crate::policy::TieringPolicy;
 use crate::tier::TierRouter;
-use crate::tierer::OpenFileTracker;
+use crate::tierer::{OpenFileTracker, TiererHandle};
 
 const TTL: Duration = Duration::from_secs(1);
 
@@ -126,6 +126,7 @@ struct FuseState {
     index: Arc<dyn PathIndex>,
     policy: Arc<dyn TieringPolicy>,
     open_tracker: Arc<OpenFileTracker>,
+    tierer: Option<TiererHandle>,
     access: Option<AccessTracker>,
     inodes: Mutex<InodeMap>,
     fh_table: Mutex<HashMap<u64, FhEntry>>,
@@ -224,6 +225,7 @@ impl FuseAdapter {
         index: Arc<dyn PathIndex>,
         policy: Arc<dyn TieringPolicy>,
         open_tracker: Arc<OpenFileTracker>,
+        tierer: Option<TiererHandle>,
         access: Option<AccessTracker>,
         config: FuseConfig,
     ) -> Self {
@@ -233,6 +235,7 @@ impl FuseAdapter {
                 index,
                 policy,
                 open_tracker,
+                tierer,
                 access,
                 inodes: Mutex::new(InodeMap::new()),
                 fh_table: Mutex::new(HashMap::new()),
@@ -411,22 +414,51 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
-        match backend.write_at(&bpath, offset as u64, data) {
-            Ok(n) => {
-                if let Some(t) = &self.state.access {
-                    t.record(logical, SystemTime::now());
+
+        // ENOSPC retry loop (D8 / P3): try the write; if ENOSPC and
+        // automatic tiering is enabled, trigger an oneshot eviction, wait
+        // for it to complete (bounded), then retry. If automatic tiering
+        // is disabled (`tier_period < 0`, see D15), return ENOSPC straight
+        // away — no surprise multi-second blocking.
+        let mut attempts = 0u32;
+        loop {
+            match backend.write_at(&bpath, offset as u64, data) {
+                Ok(n) => {
+                    if let Some(t) = &self.state.access {
+                        t.record(logical, SystemTime::now());
+                    }
+                    reply.written(n);
+                    return;
                 }
-                reply.written(n);
-            }
-            Err(e) => {
-                error!(
-                    "write {} offset={} len={}: {:?}",
-                    bpath.display(),
-                    offset,
-                    data.len(),
-                    e
-                );
-                reply.error(errno(&e));
+                Err(e) => {
+                    let is_enospc = matches!(
+                        &e,
+                        FsError::Io(io) if io.raw_os_error() == Some(libc::ENOSPC)
+                    );
+                    if !is_enospc || attempts >= 1 || self.state.policy.tier_period().is_none() {
+                        if !is_enospc {
+                            error!(
+                                "write {} offset={} len={}: {:?}",
+                                bpath.display(),
+                                offset,
+                                data.len(),
+                                e
+                            );
+                        }
+                        reply.error(errno(&e));
+                        return;
+                    }
+                    attempts += 1;
+                    warn!(
+                        "write ENOSPC on {}; triggering emergency tiering",
+                        bpath.display()
+                    );
+                    if let Some(t) = &self.state.tierer {
+                        t.trigger_oneshot();
+                        let _ = t.wait_idle(Duration::from_secs(30));
+                    }
+                    // Loop and retry.
+                }
             }
         }
     }

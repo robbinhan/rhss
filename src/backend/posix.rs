@@ -77,7 +77,24 @@ impl Backend for PosixBackend {
 
     fn fsync(&self, path: &Path) -> Result<()> {
         let f = OpenOptions::new().write(true).open(self.full(path))?;
-        f.sync_all()?;
+        // On macOS, fsync only flushes to the drive's internal cache.
+        // F_FULLFSYNC actually pushes data to platters/cells. Use it at
+        // critical persistence points (the migrate path is the main caller).
+        #[cfg(target_os = "macos")]
+        {
+            use std::os::unix::io::AsRawFd;
+            // SAFETY: f is a valid open file; fcntl with F_FULLFSYNC takes
+            // no extra argument and returns 0 on success / -1 on error. We
+            // fall back to a normal sync_all on failure.
+            let rc = unsafe { libc::fcntl(f.as_raw_fd(), libc::F_FULLFSYNC) };
+            if rc == -1 {
+                f.sync_all()?;
+            }
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            f.sync_all()?;
+        }
         Ok(())
     }
 

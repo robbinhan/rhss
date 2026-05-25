@@ -10,6 +10,7 @@
 //!   full sweep (D19).
 
 use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -108,6 +109,44 @@ fn copy_streaming(
     dst: &Arc<dyn Backend>,
     dst_path: &Path,
 ) -> Result<()> {
+    // P3.5: try kernel fast paths first (Linux copy_file_range, macOS APFS
+    // clonefile). Both fail gracefully across-FS / when unavailable —
+    // we just fall back to the streaming loop below.
+    #[cfg(target_os = "linux")]
+    {
+        use std::fs::File;
+        use std::os::unix::io::AsRawFd;
+        if let (Ok(s), Ok(d)) = (
+            File::open(src.resolve(src_path)),
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(dst.resolve(dst_path)),
+        ) {
+            let len = s.metadata().map(|m| m.len()).unwrap_or(0);
+            if len > 0 {
+                // SAFETY: both fds are valid for the duration of the call.
+                let rc = unsafe {
+                    libc::copy_file_range(
+                        s.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        d.as_raw_fd(),
+                        std::ptr::null_mut(),
+                        len as usize,
+                        0,
+                    )
+                };
+                if rc as i64 == len as i64 {
+                    return Ok(());
+                }
+                // Otherwise fall through to streaming.
+            } else {
+                return Ok(());
+            }
+        }
+    }
+
     let mut offset = 0u64;
     loop {
         let chunk = src.read_at(src_path, offset, COPY_BUF_SIZE as u32)?;
@@ -125,6 +164,7 @@ fn copy_streaming(
 /// Background tierer.
 pub struct Tierer {
     tx: Sender<TierMessage>,
+    busy: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -134,14 +174,32 @@ enum TierMessage {
     Stop,
 }
 
+/// Cheaply-clonable handle the FUSE layer holds to nudge the tierer.
 #[derive(Clone)]
 pub struct TiererHandle {
     tx: Sender<TierMessage>,
+    busy: Arc<AtomicBool>,
 }
 
 impl TiererHandle {
+    /// Fire a one-shot eviction request. Best-effort: if the channel is full
+    /// the tierer is already busy with a previous request, which is fine.
     pub fn trigger_oneshot(&self) {
         let _ = self.tx.try_send(TierMessage::Oneshot);
+    }
+
+    /// Block (sleeping 10 ms) until the tierer is idle, or `timeout` elapses.
+    /// Used by FUSE write on ENOSPC to wait for an in-flight emergency
+    /// eviction before retrying pwrite.
+    pub fn wait_idle(&self, timeout: Duration) -> bool {
+        let start = Instant::now();
+        while self.busy.load(Ordering::SeqCst) {
+            if start.elapsed() >= timeout {
+                return false;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        true
     }
 }
 
@@ -153,20 +211,20 @@ impl Tierer {
         policy: Arc<dyn TieringPolicy>,
     ) -> (Self, TiererHandle) {
         let (tx, rx) = bounded::<TierMessage>(16);
+        let busy = Arc::new(AtomicBool::new(false));
+        let busy_for_thread = Arc::clone(&busy);
         let handle = std::thread::Builder::new()
             .name("rhss-tierer".into())
-            .spawn({
-                let tx2 = tx.clone();
-                move || tierer_loop(router, index, open_tracker, policy, rx, tx2)
-            })
+            .spawn(move || tierer_loop(router, index, open_tracker, policy, rx, busy_for_thread))
             .expect("spawn tierer");
-        let h = TiererHandle { tx: tx.clone() };
-        (Self { tx, handle: Some(handle) }, h)
+        let h = TiererHandle { tx: tx.clone(), busy: Arc::clone(&busy) };
+        (Self { tx, busy, handle: Some(handle) }, h)
     }
 
     pub fn handle(&self) -> TiererHandle {
         TiererHandle {
             tx: self.tx.clone(),
+            busy: Arc::clone(&self.busy),
         }
     }
 }
@@ -186,7 +244,7 @@ fn tierer_loop(
     open_tracker: Arc<OpenFileTracker>,
     policy: Arc<dyn TieringPolicy>,
     rx: Receiver<TierMessage>,
-    _tx: Sender<TierMessage>,
+    busy: Arc<AtomicBool>,
 ) {
     let mut last_full_sweep = Instant::now();
     let day = Duration::from_secs(86_400);
@@ -223,12 +281,14 @@ fn tierer_loop(
             }
         }
 
+        busy.store(true, Ordering::SeqCst);
         evict_cold(&router, &index, &open_tracker, &policy);
 
         if last_full_sweep.elapsed() >= day {
             full_sweep(&index, &policy);
             last_full_sweep = Instant::now();
         }
+        busy.store(false, Ordering::SeqCst);
     }
 }
 

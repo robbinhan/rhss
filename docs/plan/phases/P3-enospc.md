@@ -32,4 +32,8 @@ D8(ENOSPC oneshot 重试,替代 in-flight spill)、D15(`tier_period = -1` 手动
 
 ## 状态
 
-⏳ 未开始(等 P2)
+✅ 完成 (2026-05-25)
+
+- 5 项任务全部完成:wait_idle、ENOSPC retry、F_FULLFSYNC、copy_file_range、tier_period<0 fast-fail
+- 36 个单元测试仍通过(没新增 ENOSPC 集成测试 —— 需要真实满盘)
+- 实际 ENOSPC 行为待手工跑(填 SSD 到 99% 触发 retry)
