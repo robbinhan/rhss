@@ -1,13 +1,9 @@
-//! FUSE adapter — sync, offset-aware.
+//! FUSE adapter — P1 version.
 //!
-//! P0 baseline. Just one `Backend` (no tiering yet — P1+). Key properties:
-//!
-//! - read/write pass through `offset` to `Backend::read_at` / `write_at`.
-//!   v1 corrupted large files because it read the whole file and ignored `_offset`.
-//! - `setattr` actually applies size/mode/atime/mtime (v1 was a no-op).
-//! - Multi-threaded dispatch via `fuser::Session::spawn_mount2` (D12).
-//! - `fh` stores the resolved backend path; in P2 we'll switch it to a raw fd
-//!   for zero-overhead passthrough plus `OpenFileTracker` integration.
+//! Now backed by `TierRouter` (multi-disk) and `PathIndex` (SQLite). FUSE
+//! callbacks resolve `logical_path → Location → Backend` and call the right
+//! disk. Background tierer (P2) hasn't landed yet; new files always go to
+//! Fast for now, with no migration.
 
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsStr;
@@ -18,18 +14,20 @@ use std::time::{Duration, SystemTime};
 
 use fuser::{
     FileAttr, FileType, Filesystem, MountOption, ReplyAttr, ReplyCreate, ReplyData, ReplyDirectory,
-    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
+    ReplyEmpty, ReplyEntry, ReplyOpen, ReplyStatfs, ReplyWrite, Request, TimeOrNow, FUSE_ROOT_ID,
 };
 use libc::{EEXIST, EIO, ENOENT, ENOSYS};
 use parking_lot::Mutex;
 use tracing::{debug, error, info, warn};
 
-use crate::backend::Backend;
+use crate::access::AccessTracker;
+use crate::backend::{Backend, FileMetadata as BackendMeta};
+use crate::error::FsError;
+use crate::index::{FileRow, FileState, Location, PathIndex, TierId};
+use crate::tier::TierRouter;
 
 const TTL: Duration = Duration::from_secs(1);
 
-/// FUSE filter config — paths/patterns the adapter should reject without
-/// hitting the backend.
 #[derive(Debug, Clone)]
 pub struct FuseConfig {
     ignore_names: HashSet<String>,
@@ -42,8 +40,6 @@ impl Default for FuseConfig {
         ignore_names.insert(".DS_Store".to_string());
         Self {
             ignore_names,
-            // macOS metadata files. Was previously enforced in the storage layer
-            // (wrong place); now lives here per P4.6 plan.
             ignore_prefixes: vec!["._".to_string()],
         }
     }
@@ -52,16 +48,6 @@ impl Default for FuseConfig {
 impl FuseConfig {
     pub fn new() -> Self {
         Self::default()
-    }
-
-    pub fn with_ignore_names(mut self, names: impl IntoIterator<Item = String>) -> Self {
-        self.ignore_names.extend(names);
-        self
-    }
-
-    pub fn with_ignore_prefixes(mut self, prefixes: impl IntoIterator<Item = String>) -> Self {
-        self.ignore_prefixes.extend(prefixes);
-        self
     }
 
     pub fn should_ignore(&self, path: &Path) -> bool {
@@ -74,8 +60,6 @@ impl FuseConfig {
         self.ignore_prefixes
             .iter()
             .any(|prefix| name.starts_with(prefix))
-        // v1 had `name.len() == 1 → true` which broke any single-char filename.
-        // Removed — see CHANGELOG.
     }
 }
 
@@ -87,7 +71,7 @@ struct InodeMap {
 
 impl InodeMap {
     fn new() -> Self {
-        let root_path = PathBuf::from("");
+        let root_path = PathBuf::from("/");
         let mut path_to_ino = HashMap::new();
         let mut ino_to_path = HashMap::new();
         path_to_ino.insert(root_path.clone(), FUSE_ROOT_ID);
@@ -114,58 +98,40 @@ impl InodeMap {
         self.ino_to_path.get(&ino).cloned()
     }
 
-    fn remove(&mut self, path: &Path) -> Option<u64> {
-        let ino = self.path_to_ino.remove(path)?;
-        self.ino_to_path.remove(&ino);
-        Some(ino)
+    fn remove(&mut self, path: &Path) {
+        if let Some(ino) = self.path_to_ino.remove(path) {
+            self.ino_to_path.remove(&ino);
+        }
+    }
+
+    #[allow(dead_code)]
+    fn rename(&mut self, from: &Path, to: PathBuf) {
+        if let Some(ino) = self.path_to_ino.remove(from) {
+            self.path_to_ino.insert(to.clone(), ino);
+            self.ino_to_path.insert(ino, to);
+        }
     }
 }
 
-struct FuseState {
+struct FhEntry {
+    logical: PathBuf,
     backend: Arc<dyn Backend>,
+    backend_path: PathBuf,
+}
+
+struct FuseState {
+    router: Arc<TierRouter>,
+    index: Arc<dyn PathIndex>,
+    access: Option<AccessTracker>,
     inodes: Mutex<InodeMap>,
-    fh_table: Mutex<HashMap<u64, PathBuf>>,
+    fh_table: Mutex<HashMap<u64, FhEntry>>,
     next_fh: AtomicU64,
     config: FuseConfig,
     running: AtomicBool,
 }
 
 impl FuseState {
-    fn new(backend: Arc<dyn Backend>, config: FuseConfig) -> Self {
-        Self {
-            backend,
-            inodes: Mutex::new(InodeMap::new()),
-            fh_table: Mutex::new(HashMap::new()),
-            next_fh: AtomicU64::new(1),
-            config,
-            running: AtomicBool::new(true),
-        }
-    }
-
-    fn path_for(&self, parent: u64, name: Option<&OsStr>) -> Option<PathBuf> {
-        let inodes = self.inodes.lock();
-        let mut path = inodes.lookup_path(parent)?;
-        if let Some(name) = name {
-            path.push(name);
-        }
-        Some(path)
-    }
-
-    fn allocate_fh(&self, path: PathBuf) -> u64 {
-        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
-        self.fh_table.lock().insert(fh, path);
-        fh
-    }
-
-    fn path_from_fh(&self, fh: u64) -> Option<PathBuf> {
-        self.fh_table.lock().get(&fh).cloned()
-    }
-
-    fn release_fh(&self, fh: u64) {
-        self.fh_table.lock().remove(&fh);
-    }
-
-    fn make_attr(&self, ino: u64, meta: &crate::backend::FileMetadata) -> FileAttr {
+    fn make_attr(&self, ino: u64, meta: &BackendMeta) -> FileAttr {
         FileAttr {
             ino,
             size: meta.size,
@@ -209,32 +175,72 @@ impl FuseState {
             blksize: 4096,
         }
     }
+
+    fn path_for(&self, parent: u64, name: &OsStr) -> Option<PathBuf> {
+        let inodes = self.inodes.lock();
+        let mut path = inodes.lookup_path(parent)?;
+        path.push(name);
+        Some(path)
+    }
+
+    /// Resolve a logical path to (backend, backend-relative path) by looking
+    /// up the path index. Returns `None` if not indexed.
+    fn resolve(&self, logical: &Path) -> Option<(Arc<dyn Backend>, PathBuf)> {
+        let loc = self.index.locate(logical).ok().flatten()?;
+        let backend = self.router.resolve_backend(loc.tier, &loc.backend_id)?;
+        Some((Arc::clone(backend), loc.backend_path))
+    }
+
+    fn allocate_fh(&self, entry: FhEntry) -> u64 {
+        let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
+        self.fh_table.lock().insert(fh, entry);
+        fh
+    }
+
+    fn fh(&self, fh: u64) -> Option<(Arc<dyn Backend>, PathBuf, PathBuf)> {
+        let t = self.fh_table.lock();
+        t.get(&fh)
+            .map(|e| (Arc::clone(&e.backend), e.backend_path.clone(), e.logical.clone()))
+    }
+
+    fn release_fh(&self, fh: u64) -> Option<PathBuf> {
+        self.fh_table.lock().remove(&fh).map(|e| e.logical)
+    }
 }
 
-/// Top-level FUSE filesystem.
+/// Top-level FUSE adapter.
 #[derive(Clone)]
 pub struct FuseAdapter {
     state: Arc<FuseState>,
 }
 
 impl FuseAdapter {
-    pub fn new(backend: Arc<dyn Backend>, config: FuseConfig) -> Self {
+    pub fn new(
+        router: Arc<TierRouter>,
+        index: Arc<dyn PathIndex>,
+        access: Option<AccessTracker>,
+        config: FuseConfig,
+    ) -> Self {
         Self {
-            state: Arc::new(FuseState::new(backend, config)),
+            state: Arc::new(FuseState {
+                router,
+                index,
+                access,
+                inodes: Mutex::new(InodeMap::new()),
+                fh_table: Mutex::new(HashMap::new()),
+                next_fh: AtomicU64::new(1),
+                config,
+                running: AtomicBool::new(true),
+            }),
         }
     }
 
-    /// Block on a synchronous mount. Caller's thread becomes the FUSE dispatcher.
-    ///
-    /// Single-threaded by default — for multi-threaded dispatch (D12) use
-    /// [`FuseAdapter::spawn_mount`].
     pub fn mount(&self, mount_point: &Path) -> std::io::Result<()> {
         info!("mounting rhss at {}", mount_point.display());
         fuser::mount2(self.clone(), mount_point, &Self::mount_options())?;
         Ok(())
     }
 
-    /// Multi-threaded mount. Returns a `BackgroundSession` whose drop unmounts.
     pub fn spawn_mount(&self, mount_point: &Path) -> std::io::Result<fuser::BackgroundSession> {
         info!("mounting rhss (multi-thread) at {}", mount_point.display());
         fuser::spawn_mount2(self.clone(), mount_point, &Self::mount_options())
@@ -255,7 +261,6 @@ impl FuseAdapter {
         #[cfg(target_os = "linux")]
         {
             opts.push(MountOption::AllowOther);
-            // Linux-specific perf options will land in P3.5 (max_read/max_write/etc).
         }
         opts
     }
@@ -266,8 +271,7 @@ impl FuseAdapter {
     }
 }
 
-fn errno(err: &crate::error::FsError) -> libc::c_int {
-    use crate::error::FsError;
+fn errno(err: &FsError) -> libc::c_int {
     match err {
         FsError::Io(io) => io.raw_os_error().unwrap_or(EIO),
         FsError::NotFound(_) => ENOENT,
@@ -283,7 +287,7 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOSYS);
             return;
         }
-        let Some(path) = self.state.path_for(parent, Some(name)) else {
+        let Some(path) = self.state.path_for(parent, name) else {
             reply.error(ENOENT);
             return;
         };
@@ -292,14 +296,37 @@ impl Filesystem for FuseAdapter {
             return;
         }
         debug!("lookup {}", path.display());
-        match self.state.backend.metadata(&path) {
-            Ok(meta) => {
-                let ino = self.state.inodes.lock().allocate(path.clone());
-                let attr = self.state.make_attr(ino, &meta);
-                reply.entry(&TTL, &attr, 0);
+
+        // Two possibilities: directory (resolved via filesystem walk on any
+        // backend) or file (must be in index).
+        if let Some((backend, bpath)) = self.state.resolve(&path) {
+            match backend.metadata(&bpath) {
+                Ok(meta) => {
+                    let ino = self.state.inodes.lock().allocate(path);
+                    let attr = self.state.make_attr(ino, &meta);
+                    reply.entry(&TTL, &attr, 0);
+                }
+                Err(e) => reply.error(errno(&e)),
             }
-            Err(e) => reply.error(errno(&e)),
+            return;
         }
+
+        // Maybe it's a directory. Probe each fast backend's filesystem (P1
+        // simplification: directories aren't tracked in the index; they live on
+        // every backend that has anything below them).
+        for (_tier, backend) in self.state.router.all_backends() {
+            // Strip leading "/" since backend.metadata takes a relative path.
+            let rel = path.strip_prefix("/").unwrap_or(&path);
+            if let Ok(meta) = backend.metadata(rel) {
+                if meta.is_dir {
+                    let ino = self.state.inodes.lock().allocate(path);
+                    let attr = self.state.make_attr(ino, &meta);
+                    reply.entry(&TTL, &attr, 0);
+                    return;
+                }
+            }
+        }
+        reply.error(ENOENT);
     }
 
     fn getattr(&mut self, _req: &Request, ino: u64, _fh: Option<u64>, reply: ReplyAttr) {
@@ -311,13 +338,24 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.metadata(&path) {
-            Ok(meta) => {
-                let attr = self.state.make_attr(ino, &meta);
-                reply.attr(&TTL, &attr);
+
+        if let Some((backend, bpath)) = self.state.resolve(&path) {
+            match backend.metadata(&bpath) {
+                Ok(meta) => reply.attr(&TTL, &self.state.make_attr(ino, &meta)),
+                Err(e) => reply.error(errno(&e)),
             }
-            Err(e) => reply.error(errno(&e)),
+            return;
         }
+
+        // Directory probe (same as lookup).
+        for (_tier, backend) in self.state.router.all_backends() {
+            let rel = path.strip_prefix("/").unwrap_or(&path);
+            if let Ok(meta) = backend.metadata(rel) {
+                reply.attr(&TTL, &self.state.make_attr(ino, &meta));
+                return;
+            }
+        }
+        reply.error(ENOENT);
     }
 
     fn read(
@@ -331,21 +369,19 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<u64>,
         reply: ReplyData,
     ) {
-        let Some(path) = self.state.path_from_fh(fh) else {
+        let Some((backend, bpath, logical)) = self.state.fh(fh) else {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.read_at(&path, offset as u64, size) {
-            Ok(data) => reply.data(&data),
-            Err(e) => {
-                // EOF: io::Error of UnexpectedEof or read returning 0 length.
-                if let crate::error::FsError::Io(io) = &e {
-                    if io.kind() == std::io::ErrorKind::UnexpectedEof {
-                        reply.data(&[]);
-                        return;
-                    }
+        match backend.read_at(&bpath, offset as u64, size) {
+            Ok(data) => {
+                if let Some(t) = &self.state.access {
+                    t.record(logical, SystemTime::now());
                 }
-                error!("read {} offset={} size={}: {:?}", path.display(), offset, size, e);
+                reply.data(&data);
+            }
+            Err(e) => {
+                error!("read {} offset={} size={}: {:?}", bpath.display(), offset, size, e);
                 reply.error(errno(&e));
             }
         }
@@ -363,33 +399,52 @@ impl Filesystem for FuseAdapter {
         _lock_owner: Option<u64>,
         reply: ReplyWrite,
     ) {
-        let Some(path) = self.state.path_from_fh(fh) else {
+        let Some((backend, bpath, logical)) = self.state.fh(fh) else {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.write_at(&path, offset as u64, data) {
-            Ok(n) => reply.written(n),
+        match backend.write_at(&bpath, offset as u64, data) {
+            Ok(n) => {
+                if let Some(t) = &self.state.access {
+                    t.record(logical, SystemTime::now());
+                }
+                reply.written(n);
+            }
             Err(e) => {
-                error!("write {} offset={} len={}: {:?}", path.display(), offset, data.len(), e);
+                error!(
+                    "write {} offset={} len={}: {:?}",
+                    bpath.display(),
+                    offset,
+                    data.len(),
+                    e
+                );
                 reply.error(errno(&e));
             }
         }
     }
 
     fn open(&mut self, _req: &Request, ino: u64, _flags: i32, reply: ReplyOpen) {
-        let Some(path) = self.state.inodes.lock().lookup_path(ino) else {
+        let Some(logical) = self.state.inodes.lock().lookup_path(ino) else {
             reply.error(ENOENT);
             return;
         };
-        // Verify backend has it (cheap stat).
-        match self.state.backend.exists(&path) {
-            Ok(true) => {
-                let fh = self.state.allocate_fh(path);
-                reply.opened(fh, 0);
-            }
-            Ok(false) => reply.error(ENOENT),
-            Err(e) => reply.error(errno(&e)),
+        let Some((backend, bpath)) = self.state.resolve(&logical) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if let Err(e) = backend.exists(&bpath) {
+            reply.error(errno(&e));
+            return;
         }
+        let fh = self.state.allocate_fh(FhEntry {
+            logical: logical.clone(),
+            backend,
+            backend_path: bpath,
+        });
+        if let Some(t) = &self.state.access {
+            t.record(logical, SystemTime::now());
+        }
+        reply.opened(fh, 0);
     }
 
     fn release(
@@ -416,32 +471,68 @@ impl Filesystem for FuseAdapter {
         _flags: i32,
         reply: ReplyCreate,
     ) {
-        let Some(path) = self.state.path_for(parent, Some(name)) else {
+        let Some(logical) = self.state.path_for(parent, name) else {
             reply.error(ENOENT);
             return;
         };
-        if self.state.config.should_ignore(&path) {
+        if self.state.config.should_ignore(&logical) {
             reply.error(EEXIST);
             return;
         }
-        match self.state.backend.create_file(&path) {
-            Ok(()) => {
-                let _ = self.state.backend.set_permissions(&path, mode);
-                match self.state.backend.metadata(&path) {
-                    Ok(meta) => {
-                        let ino = self.state.inodes.lock().allocate(path.clone());
-                        let fh = self.state.allocate_fh(path);
-                        let attr = self.state.make_attr(ino, &meta);
-                        reply.created(&TTL, &attr, 0, fh, 0);
-                    }
-                    Err(e) => reply.error(errno(&e)),
-                }
-            }
+
+        // Pick destination backend (P2 will add panic_watermark routing; for
+        // now always Fast).
+        let tier = TierId::Fast;
+        let backend = match self.state.router.tier(tier).pick() {
+            Ok(b) => Arc::clone(b),
             Err(e) => {
-                error!("create {}: {:?}", path.display(), e);
                 reply.error(errno(&e));
+                return;
             }
+        };
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
+
+        if let Err(e) = backend.create_file(&rel) {
+            error!("create {}: {:?}", logical.display(), e);
+            reply.error(errno(&e));
+            return;
         }
+        let _ = backend.set_permissions(&rel, mode);
+        let meta = match backend.metadata(&rel) {
+            Ok(m) => m,
+            Err(e) => {
+                reply.error(errno(&e));
+                return;
+            }
+        };
+
+        let row = FileRow {
+            logical_path: logical.clone(),
+            location: Location {
+                tier,
+                backend_id: backend.id().to_string(),
+                backend_path: rel.clone(),
+                size: meta.size,
+            },
+            last_access: SystemTime::now(),
+            hit_count: 0,
+            popularity: 0.0,
+            pinned_tier: None,
+            state: FileState::Stable,
+        };
+        if let Err(e) = self.state.index.insert(row) {
+            reply.error(errno(&e));
+            return;
+        }
+
+        let ino = self.state.inodes.lock().allocate(logical.clone());
+        let fh = self.state.allocate_fh(FhEntry {
+            logical,
+            backend,
+            backend_path: rel,
+        });
+        let attr = self.state.make_attr(ino, &meta);
+        reply.created(&TTL, &attr, 0, fh, 0);
     }
 
     fn mkdir(
@@ -453,52 +544,76 @@ impl Filesystem for FuseAdapter {
         _umask: u32,
         reply: ReplyEntry,
     ) {
-        let Some(path) = self.state.path_for(parent, Some(name)) else {
+        let Some(logical) = self.state.path_for(parent, name) else {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.create_dir(&path) {
-            Ok(()) => {
-                let _ = self.state.backend.set_permissions(&path, mode);
-                match self.state.backend.metadata(&path) {
-                    Ok(meta) => {
-                        let ino = self.state.inodes.lock().allocate(path);
-                        let attr = self.state.make_attr(ino, &meta);
-                        reply.entry(&TTL, &attr, 0);
-                    }
-                    Err(e) => reply.error(errno(&e)),
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
+        // Create on EVERY backend so the dir is visible from anywhere.
+        let mut ok_meta: Option<BackendMeta> = None;
+        for (_tier, b) in self.state.router.all_backends() {
+            if let Err(e) = b.create_dir(&rel) {
+                warn!("mkdir on {}: {:?}", b.id(), e);
+            } else {
+                let _ = b.set_permissions(&rel, mode);
+                if ok_meta.is_none() {
+                    ok_meta = b.metadata(&rel).ok();
                 }
             }
-            Err(e) => reply.error(errno(&e)),
         }
+        let Some(meta) = ok_meta else {
+            reply.error(EIO);
+            return;
+        };
+        let ino = self.state.inodes.lock().allocate(logical);
+        let attr = self.state.make_attr(ino, &meta);
+        reply.entry(&TTL, &attr, 0);
     }
 
     fn unlink(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(path) = self.state.path_for(parent, Some(name)) else {
+        let Some(logical) = self.state.path_for(parent, name) else {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.remove(&path) {
-            Ok(()) => {
-                self.state.inodes.lock().remove(&path);
-                reply.ok();
-            }
-            Err(e) => reply.error(errno(&e)),
+        let Some((backend, bpath)) = self.state.resolve(&logical) else {
+            reply.error(ENOENT);
+            return;
+        };
+        if let Err(e) = backend.remove(&bpath) {
+            reply.error(errno(&e));
+            return;
         }
+        if let Err(e) = self.state.index.remove(&logical) {
+            warn!("index.remove {}: {:?}", logical.display(), e);
+        }
+        self.state.inodes.lock().remove(&logical);
+        reply.ok();
     }
 
     fn rmdir(&mut self, _req: &Request, parent: u64, name: &OsStr, reply: ReplyEmpty) {
-        let Some(path) = self.state.path_for(parent, Some(name)) else {
+        let Some(logical) = self.state.path_for(parent, name) else {
             reply.error(ENOENT);
             return;
         };
-        match self.state.backend.remove(&path) {
-            Ok(()) => {
-                self.state.inodes.lock().remove(&path);
-                reply.ok();
+        let rel = logical.strip_prefix("/").unwrap_or(&logical).to_path_buf();
+        let mut last_err: Option<FsError> = None;
+        let mut removed_anywhere = false;
+        for (_tier, b) in self.state.router.all_backends() {
+            match b.remove(&rel) {
+                Ok(()) => removed_anywhere = true,
+                Err(e) => {
+                    last_err = Some(e);
+                }
             }
-            Err(e) => reply.error(errno(&e)),
         }
+        if !removed_anywhere {
+            if let Some(e) = last_err {
+                reply.error(errno(&e));
+                return;
+            }
+        }
+        self.state.inodes.lock().remove(&logical);
+        reply.ok();
     }
 
     fn readdir(
@@ -513,36 +628,42 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
-        let entries = match self.state.backend.list_dir(&dir_path) {
-            Ok(e) => e,
-            Err(e) => {
-                reply.error(errno(&e));
-                return;
-            }
-        };
+        let rel = dir_path.strip_prefix("/").unwrap_or(&dir_path).to_path_buf();
 
-        let mut all = Vec::with_capacity(entries.len() + 2);
+        // Merge entries from every backend into one logical view, deduping
+        // (same name across backends shows up once).
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut all: Vec<(u64, FileType, String)> = Vec::new();
         all.push((ino, FileType::Directory, ".".to_string()));
         all.push((ino, FileType::Directory, "..".to_string()));
-        for name in entries {
-            let entry_path = dir_path.join(&name);
-            if self.state.config.should_ignore(&entry_path) {
-                continue;
+
+        for (_tier, b) in self.state.router.all_backends() {
+            let entries = match b.list_dir(&rel) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for name in entries {
+                if !seen.insert(name.clone()) {
+                    continue;
+                }
+                let entry_path = dir_path.join(&name);
+                if self.state.config.should_ignore(&entry_path) {
+                    continue;
+                }
+                let entry_rel = entry_path.strip_prefix("/").unwrap_or(&entry_path).to_path_buf();
+                let kind = b
+                    .metadata(&entry_rel)
+                    .map(|m| {
+                        if m.is_dir {
+                            FileType::Directory
+                        } else {
+                            FileType::RegularFile
+                        }
+                    })
+                    .unwrap_or(FileType::RegularFile);
+                let entry_ino = self.state.inodes.lock().allocate(entry_path);
+                all.push((entry_ino, kind, name));
             }
-            let kind = self
-                .state
-                .backend
-                .metadata(&entry_path)
-                .map(|m| {
-                    if m.is_dir {
-                        FileType::Directory
-                    } else {
-                        FileType::RegularFile
-                    }
-                })
-                .unwrap_or(FileType::RegularFile);
-            let entry_ino = self.state.inodes.lock().allocate(entry_path);
-            all.push((entry_ino, kind, name));
         }
 
         for (i, (entry_ino, kind, name)) in all.into_iter().enumerate().skip(offset as usize) {
@@ -571,27 +692,32 @@ impl Filesystem for FuseAdapter {
         _flags: Option<u32>,
         reply: ReplyAttr,
     ) {
-        let path = match fh.and_then(|h| self.state.path_from_fh(h)) {
-            Some(p) => p,
-            None => match self.state.inodes.lock().lookup_path(ino) {
-                Some(p) => p,
-                None => {
+        let resolved = match fh.and_then(|h| self.state.fh(h)) {
+            Some((b, p, _)) => (b, p),
+            None => {
+                let Some(logical) = self.state.inodes.lock().lookup_path(ino) else {
                     reply.error(ENOENT);
                     return;
-                }
-            },
+                };
+                let Some(r) = self.state.resolve(&logical) else {
+                    reply.error(ENOENT);
+                    return;
+                };
+                r
+            }
         };
+        let (backend, bpath) = resolved;
 
         if let Some(new_size) = size {
-            if let Err(e) = self.state.backend.truncate(&path, new_size) {
-                error!("setattr truncate {}: {:?}", path.display(), e);
+            if let Err(e) = backend.truncate(&bpath, new_size) {
+                error!("truncate {}: {:?}", bpath.display(), e);
                 reply.error(errno(&e));
                 return;
             }
         }
         if let Some(new_mode) = mode {
-            if let Err(e) = self.state.backend.set_permissions(&path, new_mode) {
-                warn!("setattr chmod {}: {:?}", path.display(), e);
+            if let Err(e) = backend.set_permissions(&bpath, new_mode) {
+                warn!("chmod {}: {:?}", bpath.display(), e);
             }
         }
         if atime.is_some() || mtime.is_some() {
@@ -603,17 +729,26 @@ impl Filesystem for FuseAdapter {
                 TimeOrNow::SpecificTime(t) => t,
                 TimeOrNow::Now => SystemTime::now(),
             });
-            if let Err(e) = self.state.backend.set_times(&path, at, mt) {
-                warn!("setattr utimes {}: {:?}", path.display(), e);
+            if let Err(e) = backend.set_times(&bpath, at, mt) {
+                warn!("utimes {}: {:?}", bpath.display(), e);
             }
         }
 
-        match self.state.backend.metadata(&path) {
-            Ok(meta) => {
-                let attr = self.state.make_attr(ino, &meta);
-                reply.attr(&TTL, &attr);
-            }
+        match backend.metadata(&bpath) {
+            Ok(meta) => reply.attr(&TTL, &self.state.make_attr(ino, &meta)),
             Err(e) => reply.error(errno(&e)),
         }
+    }
+
+    fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
+        let (fast_total, _fast_used, fast_free) = self.state.router.fast.capacity();
+        let (slow_total, _slow_used, slow_free) = self.state.router.slow.capacity();
+        let total = fast_total + slow_total;
+        let free = fast_free + slow_free;
+        let bsize = 4096u32;
+        let blocks = total / bsize as u64;
+        let bfree = free / bsize as u64;
+        let files = self.state.index.count().unwrap_or(0);
+        reply.statfs(blocks, bfree, bfree, files, 0, bsize, 255, bsize);
     }
 }

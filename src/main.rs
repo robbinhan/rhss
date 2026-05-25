@@ -1,9 +1,8 @@
-//! rhss CLI — P0 baseline.
+//! rhss CLI — P1.
 //!
-//! Mounts a single backend (one directory) at a mount point. Tiering, multi-
-//! disk routing, and the path index all arrive in P1+. This binary's purpose
-//! at P0 is to exercise the sync `Backend` + offset-aware FUSE pipeline so
-//! `dd bs=4k` of a 1 GiB file roundtrips correctly.
+//! Reads a TOML config (multi-backend per tier), opens the SQLite path index,
+//! runs the first-scan if the index is empty, starts the access tracker,
+//! mounts FUSE in a background session, waits for SIGINT/SIGTERM/SIGHUP.
 
 use std::path::PathBuf;
 use std::process::Command;
@@ -14,23 +13,24 @@ use std::sync::{
 use std::time::Duration;
 
 use clap::Parser;
-use rhss::{FuseAdapter, PosixBackend};
+use rhss::access::AccessTracker;
+use rhss::backend::Backend;
+use rhss::config::RhssConfig;
 use rhss::fuse::FuseConfig;
+use rhss::index::{PathIndex, SqlitePathIndex, TierId};
 use rhss::lock::StorageLock;
+use rhss::scan;
+use rhss::tier::{MostFreePlacement, Tier, TierRouter};
+use rhss::{FuseAdapter, PosixBackend};
 use tracing::{error, info, warn};
 use tracing_subscriber::{fmt, EnvFilter};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about, long_about = None)]
 struct Args {
-    /// Mount point (must be an empty directory).
+    /// Path to the TOML config file.
     #[arg(short, long)]
-    mount: PathBuf,
-
-    /// Backend root directory. For P0 this is a single directory; P1 will
-    /// switch to a config file that declares multiple per-tier backends.
-    #[arg(short, long)]
-    backend: PathBuf,
+    config: PathBuf,
 
     /// Force startup even if a stale storage lock exists.
     #[arg(long, default_value_t = false)]
@@ -45,20 +45,29 @@ fn main() {
         .init();
 
     let args = Args::parse();
+    let cfg = match RhssConfig::load(&args.config) {
+        Ok(c) => c,
+        Err(e) => {
+            error!("load config {}: {e}", args.config.display());
+            std::process::exit(2);
+        }
+    };
 
-    if let Err(e) = std::fs::create_dir_all(&args.mount) {
-        error!("create mount point {}: {}", args.mount.display(), e);
+    if let Err(e) = std::fs::create_dir_all(&cfg.mount) {
+        error!("create mount point {}: {e}", cfg.mount.display());
         std::process::exit(1);
     }
-    if !args.backend.is_dir() {
-        error!("backend directory does not exist: {}", args.backend.display());
-        std::process::exit(1);
+    if let Some(parent) = cfg.db.parent() {
+        if !parent.as_os_str().is_empty() {
+            let _ = std::fs::create_dir_all(parent);
+        }
     }
 
-    let lock = Arc::new(std::sync::Mutex::new(StorageLock::new(
-        &args.backend,
-        &args.backend,
-    )));
+    // The lock is just a coarse "only one rhss process at a time" gate. Use
+    // the db file's parent as both hot and cold paths for the lock — same
+    // physical location.
+    let lock_dir = cfg.db.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+    let lock = Arc::new(std::sync::Mutex::new(StorageLock::new(&lock_dir, &lock_dir)));
     {
         let mut g = lock.lock().unwrap();
         let res = if args.force { g.force_lock() } else { g.try_lock() };
@@ -69,25 +78,89 @@ fn main() {
     }
     info!("acquired storage lock");
 
-    let backend = match PosixBackend::new("posix0", args.backend.clone()) {
-        Ok(b) => Arc::new(b) as Arc<dyn rhss::Backend>,
+    // Ensure every backend root exists.
+    let all_roots: Vec<&std::path::Path> = cfg
+        .tier
+        .fast
+        .iter()
+        .chain(cfg.tier.slow.iter())
+        .map(|b| b.root.as_path())
+        .collect();
+    if let Err(e) = scan::ensure_managed_dirs(all_roots.iter().copied()) {
+        error!("prepare backend dirs: {e}");
+        std::process::exit(1);
+    }
+
+    // Build router.
+    let make_backend = |id: &str, root: &std::path::Path| -> Arc<dyn Backend> {
+        Arc::new(PosixBackend::new(id, root.to_path_buf()).expect("backend init"))
+    };
+    let fast_backends: Vec<Arc<dyn Backend>> = cfg
+        .tier
+        .fast
+        .iter()
+        .map(|b| make_backend(&b.id, &b.root))
+        .collect();
+    let slow_backends: Vec<Arc<dyn Backend>> = cfg
+        .tier
+        .slow
+        .iter()
+        .map(|b| make_backend(&b.id, &b.root))
+        .collect();
+
+    let fast = Tier::new(TierId::Fast, fast_backends, Box::new(MostFreePlacement)).expect("fast tier");
+    let slow = Tier::new(TierId::Slow, slow_backends, Box::new(MostFreePlacement)).expect("slow tier");
+    let router = Arc::new(TierRouter::new(fast, slow));
+
+    // Open index.
+    let index: Arc<dyn PathIndex> = match SqlitePathIndex::open(&cfg.db) {
+        Ok(i) => i,
         Err(e) => {
-            error!("init backend: {e}");
+            error!("open index {}: {e}", cfg.db.display());
             std::process::exit(1);
         }
     };
 
-    let adapter = FuseAdapter::new(backend, FuseConfig::default());
+    // First-scan if empty. Conflicts → hard fail (D13).
+    if index.count().unwrap_or(0) == 0 {
+        info!("path index is empty, running first scan");
+    }
+    match scan::first_scan(&router, &index) {
+        Ok(stats) => {
+            if !stats.conflicts.is_empty() {
+                error!(
+                    count = stats.conflicts.len(),
+                    "first-scan hard-fail: cross-backend logical-path conflicts; aborting"
+                );
+                for p in stats.conflicts.iter().take(20) {
+                    error!("  conflict: {}", p.display());
+                }
+                std::process::exit(1);
+            }
+        }
+        Err(e) => {
+            error!("first scan: {e}");
+            std::process::exit(1);
+        }
+    }
 
-    // Mount in background so the main thread can wait on signals.
-    let session = match adapter.spawn_mount(&args.mount) {
+    let access = AccessTracker::start(Arc::clone(&index), Duration::from_secs(5));
+
+    let adapter = FuseAdapter::new(
+        Arc::clone(&router),
+        Arc::clone(&index),
+        Some(access),
+        FuseConfig::default(),
+    );
+
+    let session = match adapter.spawn_mount(&cfg.mount) {
         Ok(s) => s,
         Err(e) => {
-            error!("mount {}: {e}", args.mount.display());
+            error!("mount {}: {e}", cfg.mount.display());
             std::process::exit(1);
         }
     };
-    info!("rhss mounted at {}", args.mount.display());
+    info!("rhss mounted at {}", cfg.mount.display());
 
     let stop = Arc::new(AtomicBool::new(false));
     {
@@ -106,13 +179,12 @@ fn main() {
 
     info!("stopping adapter");
     adapter.stop();
-    drop(session); // triggers unmount
+    drop(session);
 
-    // Best-effort: if the OS didn't catch the AutoUnmount option, run umount.
     std::thread::sleep(Duration::from_millis(200));
-    if is_still_mounted(&args.mount) {
+    if is_still_mounted(&cfg.mount) {
         warn!("mount still appears active; running explicit unmount");
-        let _ = unmount(&args.mount);
+        let _ = unmount(&cfg.mount);
     }
 
     {

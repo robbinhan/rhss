@@ -36,4 +36,9 @@ D4(Vec<Backend>)、D5(SQLite 索引)、D11(rhss 自管多盘)、D13(`.rhss_manag
 
 ## 状态
 
-⏳ 未开始(等 P0)
+✅ 完成 (2026-05-25)
+
+- 全部 8 项任务完成
+- 24 个单元测试通过(P0 8 + P1 新增 16:PathIndex 7 + placement 2 + AccessTracker 1 + scan 3 + config 3)
+- cargo build 零错误
+- 实际多盘挂载 + 持久化 round-trip 测试待手工跑(需 macFUSE)

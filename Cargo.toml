@@ -17,6 +17,11 @@ clap = { version = "4.5", features = ["derive"] }
 ctrlc = { version = "3.4.2", features = ["termination"] }
 whoami = "1.5"
 parking_lot = "0.12"
+rusqlite = { version = "0.31", features = ["bundled"] }
+lru = "0.12"
+toml = "0.8"
+walkdir = "2.5"
+crossbeam-channel = "0.5"
 
 [dev-dependencies]
 tempfile = "3.8"
