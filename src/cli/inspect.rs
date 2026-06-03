@@ -72,6 +72,71 @@ pub fn coldest(ctx: &CliContext, args: TopArgs) -> Result<()> {
     print_top_table(ctx, &rows, "coldest")
 }
 
+pub fn replicas(ctx: &CliContext, args: WhichArgs) -> Result<()> {
+    let index = ctx.open_index()?;
+    let logical = normalize_logical(&args.path);
+    let row = match index.get(&logical)? {
+        Some(r) => r,
+        None => {
+            tracing::error!("not indexed: {}", logical.display());
+            std::process::exit(1);
+        }
+    };
+    if ctx.json {
+        #[derive(serde::Serialize)]
+        struct ReplicasJson {
+            logical_path: String,
+            tier: &'static str,
+            primary: ReplicaItem,
+            replicas: Vec<ReplicaItem>,
+        }
+        #[derive(serde::Serialize)]
+        struct ReplicaItem {
+            backend_id: String,
+            backend_path: String,
+        }
+        let primary = ReplicaItem {
+            backend_id: row.location.backend_id.clone(),
+            backend_path: row.location.backend_path.display().to_string(),
+        };
+        let replicas: Vec<ReplicaItem> = row
+            .replicas
+            .iter()
+            .map(|r| ReplicaItem {
+                backend_id: r.backend_id.clone(),
+                backend_path: r.backend_path.display().to_string(),
+            })
+            .collect();
+        let payload = ReplicasJson {
+            logical_path: logical.display().to_string(),
+            tier: tier_name(row.location.tier),
+            primary,
+            replicas,
+        };
+        println!("{}", serde_json::to_string_pretty(&payload)?);
+    } else {
+        println!("{}  ({})", logical.display(), tier_name(row.location.tier));
+        println!(
+            "  primary   {:<14}  {}",
+            row.location.backend_id,
+            row.location.backend_path.display()
+        );
+        if row.replicas.is_empty() {
+            println!("  (no extra replicas — single-replica file)");
+        } else {
+            for r in &row.replicas {
+                let label = if r.backend_id == row.location.backend_id {
+                    "  primary*  "
+                } else {
+                    "  replica   "
+                };
+                println!("{}{:<14}  {}", label, r.backend_id, r.backend_path.display());
+            }
+        }
+    }
+    Ok(())
+}
+
 pub fn list_pinned(ctx: &CliContext) -> Result<()> {
     let rows = ctx.open_index()?.list_pinned()?;
     if ctx.json {

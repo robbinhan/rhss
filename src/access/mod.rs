@@ -119,6 +119,7 @@ mod tests {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            replicas: Vec::new(),
         })
         .unwrap();
 

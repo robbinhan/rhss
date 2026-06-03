@@ -7,7 +7,25 @@ use crate::backend::Backend;
 use crate::error::{FsError, Result};
 
 pub trait Placement: Send + Sync {
+    /// Pick a single backend for a new file. Used by callers that handle
+    /// only one location at a time (legacy callers, FUSE create on
+    /// non-mirror tiers, etc.).
     fn pick<'a>(&self, backends: &'a [Arc<dyn Backend>]) -> Result<&'a Arc<dyn Backend>>;
+
+    /// Pick all backends a write should land on. For single-location
+    /// placements (MostFree, RoundRobin) returns one backend; for
+    /// `MirrorPlacement` returns all backends.
+    fn pick_all<'a>(
+        &self,
+        backends: &'a [Arc<dyn Backend>],
+    ) -> Result<Vec<&'a Arc<dyn Backend>>> {
+        Ok(vec![self.pick(backends)?])
+    }
+
+    /// Hint flag: does this placement strategy use multiple backends per file?
+    fn is_replicated(&self) -> bool {
+        false
+    }
 }
 
 /// Pick the backend with the most free space. MVP default.
@@ -56,6 +74,52 @@ impl Placement for RoundRobinPlacement {
         }
         let i = self.next.fetch_add(1, Ordering::SeqCst) % backends.len();
         Ok(&backends[i])
+    }
+}
+
+/// Mirror — every write lands on every backend in the tier (D23). For
+/// reads, `pick` returns one chosen backend (round-robin) so callers that
+/// only need one location don't try to download from N at once. Use
+/// `pick_all` for the N-write path during migration.
+pub struct MirrorPlacement {
+    next: AtomicUsize,
+}
+
+impl MirrorPlacement {
+    pub fn new() -> Self {
+        Self {
+            next: AtomicUsize::new(0),
+        }
+    }
+}
+
+impl Default for MirrorPlacement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Placement for MirrorPlacement {
+    fn pick<'a>(&self, backends: &'a [Arc<dyn Backend>]) -> Result<&'a Arc<dyn Backend>> {
+        if backends.is_empty() {
+            return Err(FsError::Storage("mirror: empty backend list".into()));
+        }
+        let i = self.next.fetch_add(1, Ordering::SeqCst) % backends.len();
+        Ok(&backends[i])
+    }
+
+    fn pick_all<'a>(
+        &self,
+        backends: &'a [Arc<dyn Backend>],
+    ) -> Result<Vec<&'a Arc<dyn Backend>>> {
+        if backends.is_empty() {
+            return Err(FsError::Storage("mirror: empty backend list".into()));
+        }
+        Ok(backends.iter().collect())
+    }
+
+    fn is_replicated(&self) -> bool {
+        true
     }
 }
 
@@ -138,6 +202,36 @@ mod tests {
         let p = MostFreePlacement;
         let chosen = p.pick(&bs).unwrap();
         assert_eq!(chosen.id(), "b");
+    }
+
+    #[test]
+    fn mirror_returns_all_backends() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(FakeBackend { id: "a".into(), free: 100 }),
+            Arc::new(FakeBackend { id: "b".into(), free: 999 }),
+            Arc::new(FakeBackend { id: "c".into(), free: 500 }),
+        ];
+        let p = MirrorPlacement::new();
+        let all = p.pick_all(&bs).unwrap();
+        assert_eq!(all.len(), 3);
+        let ids: Vec<&str> = all.iter().map(|b| b.id()).collect();
+        assert!(ids.contains(&"a"));
+        assert!(ids.contains(&"b"));
+        assert!(ids.contains(&"c"));
+        assert!(p.is_replicated());
+    }
+
+    #[test]
+    fn most_free_pick_all_returns_one() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(FakeBackend { id: "a".into(), free: 100 }),
+            Arc::new(FakeBackend { id: "b".into(), free: 999 }),
+        ];
+        let p = MostFreePlacement;
+        let all = p.pick_all(&bs).unwrap();
+        assert_eq!(all.len(), 1);
+        assert_eq!(all[0].id(), "b");
+        assert!(!p.is_replicated());
     }
 
     #[test]

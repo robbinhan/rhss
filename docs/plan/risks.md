@@ -37,6 +37,13 @@
 | 候选-B | **文件 mutability 列 + 利用其做分层决策** | HydraDB Memories vs Knowledge 二分启发 | v0.4 评估 | `PathIndex` 加列 `mutability TEXT CHECK ('mutable','immutable','unknown')`;来源:`chflags uchg` / `chattr +i` 显式标记 + 连续 N 天 mtime 不变自动转 immutable;immutable 文件可激进下沉、可在 Slow 层做 zstd 压缩/去重。预计 ~1 周 |
 | 候选-C | **per-backend `cost_per_gb_month` + 成本感知 placement** | HydraDB 按存储分层定价启发 | v0.5 评估 | `BackendStats` 加 `cost_per_gb_month: Option<f64>`;配置每个 backend 可选声明成本;新增 `CostAwarePlacement`(对成本敏感时优先便宜的 backend,反之 fallback 到 `MostFreePlacement`)。预计 ~3 天,trait 已支持 |
 
+## 候选(已落地)
+
+| 编号 | 候选项 | 备注 |
+|---|---|---|
+| ✅ 候选-A | S3 archive 第三层 | 详见 D22。商家无关 S3 兼容协议(R2/B2/Wasabi/MinIO);staging cache;rust-s3 sync;tierer 链式 Fast→Slow→Archive |
+| ✅ 候选-D | 多副本(MirrorPlacement)| 详见 D23。任一 tier 可选 `placement = "mirror"`;migrate 多副本写入 + 回滚;FUSE open 副本 fallback;`rhss replicas` CLI;fsck 检测一致性 |
+
 ## 跑偏检测清单(每周 review)
 
 - [ ] 是否有任何 D 项被静默修改而没更新 [decisions.md](./decisions.md)?

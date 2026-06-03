@@ -200,16 +200,31 @@ fn render_data(d: ResponseData) {
         Fsck {
             orphans,
             ghosts,
+            inconsistencies,
             repaired,
         } => {
-            println!("fsck: {} orphans, {} ghosts, {} repaired", orphans.len(), ghosts.len(), repaired);
+            println!(
+                "fsck: {} orphans, {} ghosts, {} replica inconsistencies, {} repaired",
+                orphans.len(),
+                ghosts.len(),
+                inconsistencies.len(),
+                repaired
+            );
             for o in orphans.iter().take(50) {
                 println!("  orphan: {}", o.display());
             }
             for g in ghosts.iter().take(50) {
                 println!("  ghost:  {}", g.display());
             }
-            if orphans.len() > 50 || ghosts.len() > 50 {
+            for inc in inconsistencies.iter().take(50) {
+                println!(
+                    "  replica-missing: {} (expected on {:?}, missing on {:?})",
+                    inc.path.display(),
+                    inc.expected,
+                    inc.missing
+                );
+            }
+            if orphans.len() > 50 || ghosts.len() > 50 || inconsistencies.len() > 50 {
                 println!("  (truncated; rerun with --json for the full list)");
             }
         }

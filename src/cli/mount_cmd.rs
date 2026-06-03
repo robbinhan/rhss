@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::access::AccessTracker;
 use crate::backend::{Backend, S3Backend, S3Config};
+use crate::config::TierPolicy;
 use crate::control::{server::OpContext, socket_path_for, ControlServer};
 use crate::error::{FsError, Result};
 use crate::fuse::FuseConfig;
@@ -20,9 +21,19 @@ use crate::index::{PathIndex, SqlitePathIndex, TierId};
 use crate::lock::StorageLock;
 use crate::policy::{PopularityPolicy, TieringPolicy};
 use crate::scan;
-use crate::tier::{MostFreePlacement, Tier, TierRouter};
+use crate::tier::{MirrorPlacement, MostFreePlacement, Placement, RoundRobinPlacement, Tier, TierRouter};
 use crate::tierer::{OpenFileTracker, Tierer};
 use crate::{FuseAdapter, PosixBackend};
+
+fn make_placement(pol: Option<&TierPolicy>) -> Result<Box<dyn Placement>> {
+    let name = pol.map(|p| p.placement.as_str()).unwrap_or("most_free");
+    Ok(match name {
+        "most_free" => Box::new(MostFreePlacement),
+        "round_robin" => Box::new(RoundRobinPlacement::new()),
+        "mirror" => Box::new(MirrorPlacement::new()),
+        other => return Err(FsError::Storage(format!("unknown placement: {other}"))),
+    })
+}
 
 use super::common::CliContext;
 use super::MountArgs;
@@ -88,10 +99,22 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
         .map(|b| make_backend(&b.id, &b.root))
         .collect();
 
-    let fast = Tier::new(TierId::Fast, fast_backends, Box::new(MostFreePlacement))
-        .expect("fast tier");
-    let slow = Tier::new(TierId::Slow, slow_backends, Box::new(MostFreePlacement))
-        .expect("slow tier");
+    let fast_pl = match make_placement(cfg.tier.fast_policy.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("fast tier placement: {e}");
+            std::process::exit(1);
+        }
+    };
+    let slow_pl = match make_placement(cfg.tier.slow_policy.as_ref()) {
+        Ok(p) => p,
+        Err(e) => {
+            error!("slow tier placement: {e}");
+            std::process::exit(1);
+        }
+    };
+    let fast = Tier::new(TierId::Fast, fast_backends, fast_pl).expect("fast tier");
+    let slow = Tier::new(TierId::Slow, slow_backends, slow_pl).expect("slow tier");
     let mut router = TierRouter::new(fast, slow);
 
     // Archive tier (optional). Each S3-style backend needs its creds via env
@@ -146,13 +169,19 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
             };
             archive_backends.push(backend);
         }
-        let archive_tier =
-            Tier::new(TierId::Archive, archive_backends, Box::new(MostFreePlacement))
-                .map_err(|e| FsError::Storage(format!("archive tier: {e}")))
-                .unwrap_or_else(|e| {
-                    error!("{e}");
-                    std::process::exit(1);
-                });
+        let archive_pl = match make_placement(cfg.tier.archive_policy.as_ref()) {
+            Ok(p) => p,
+            Err(e) => {
+                error!("archive tier placement: {e}");
+                std::process::exit(1);
+            }
+        };
+        let archive_tier = Tier::new(TierId::Archive, archive_backends, archive_pl)
+            .map_err(|e| FsError::Storage(format!("archive tier: {e}")))
+            .unwrap_or_else(|e| {
+                error!("{e}");
+                std::process::exit(1);
+            });
         router = router.with_archive(archive_tier);
         info!("archive tier configured with {} backend(s)", cfg.tier.archive.len());
     }

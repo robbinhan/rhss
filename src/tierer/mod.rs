@@ -19,7 +19,7 @@ use tracing::{debug, info, warn};
 
 use crate::backend::Backend;
 use crate::error::{FsError, Result};
-use crate::index::{Location, PathIndex, TierId};
+use crate::index::{Location, PathIndex, ReplicaLoc, TierId};
 use crate::policy::TieringPolicy;
 use crate::tier::TierRouter;
 
@@ -62,45 +62,91 @@ pub fn migrate(
                 row.location.backend_id
             ))
         })?;
-    let dst_backend = router
+    let dst_tier = router
         .tier(target_tier)
-        .ok_or_else(|| FsError::Storage(format!("target tier {:?} not configured", target_tier)))?
-        .pick()?;
+        .ok_or_else(|| FsError::Storage(format!("target tier {:?} not configured", target_tier)))?;
+    let dst_backends = dst_tier.placement.pick_all(&dst_tier.backends)?;
+    let is_mirror = dst_tier.placement.is_replicated();
 
-    if Arc::ptr_eq(src_backend, dst_backend) {
-        // Same backend — nothing to do.
+    // Same-backend short-circuit only applies in the single-replica case.
+    if !is_mirror && dst_backends.len() == 1 && Arc::ptr_eq(src_backend, dst_backends[0]) {
         return Ok(false);
     }
 
     let dst_path = row.location.backend_path.clone();
 
-    // 1. Stream-copy src -> dst.
-    copy_streaming(src_backend, &row.location.backend_path, dst_backend, &dst_path)?;
-    dst_backend.fsync(&dst_path)?;
-
-    // 2. Preserve atime/mtime (D16).
-    if let Ok(orig_meta) = src_backend.metadata(&row.location.backend_path) {
-        let _ = dst_backend.set_times(&dst_path, Some(orig_meta.atime), Some(orig_meta.mtime));
+    // 1. Stream-copy src -> all dst backends. On any failure, roll back
+    //    every dst write we already did (best-effort delete), then bail.
+    let mut written: Vec<&Arc<dyn Backend>> = Vec::with_capacity(dst_backends.len());
+    for dst in &dst_backends {
+        if let Err(e) = copy_streaming(src_backend, &row.location.backend_path, dst, &dst_path) {
+            warn!(
+                "migrate {} replica {} failed; rolling back",
+                logical.display(),
+                dst.id()
+            );
+            for already in &written {
+                let _ = already.remove(&dst_path);
+            }
+            return Err(e);
+        }
+        if let Err(e) = dst.fsync(&dst_path) {
+            warn!(
+                "migrate {} replica {} fsync failed; rolling back",
+                logical.display(),
+                dst.id()
+            );
+            let _ = dst.remove(&dst_path);
+            for already in &written {
+                let _ = already.remove(&dst_path);
+            }
+            return Err(e);
+        }
+        written.push(dst);
     }
 
-    // 3. Atomic index swap (single SQLite UPDATE).
+    // 2. Preserve atime/mtime on every replica (D16).
+    if let Ok(orig_meta) = src_backend.metadata(&row.location.backend_path) {
+        for dst in &written {
+            let _ = dst.set_times(&dst_path, Some(orig_meta.atime), Some(orig_meta.mtime));
+        }
+    }
+
+    // 3. Update the index. Primary = first replica; full list in `replicas`
+    //    when mirroring. For single-replica we leave replicas empty so we
+    //    don't bloat the index for the common case.
+    let primary = written[0];
     let new_loc = Location {
         tier: target_tier,
-        backend_id: dst_backend.id().to_string(),
-        backend_path: dst_path,
+        backend_id: primary.id().to_string(),
+        backend_path: dst_path.clone(),
         size: row.location.size,
     };
-    index.swap_location(logical, new_loc)?;
+    let replicas: Vec<ReplicaLoc> = if is_mirror {
+        written
+            .iter()
+            .map(|b| ReplicaLoc::new(b.id().to_string(), dst_path.clone()))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
-    // 4. Best-effort source unlink. If this fails the file becomes an
-    //    orphan on the source backend — a startup scrub (P3/P4) will clean
-    //    up such orphans by reconciling backends against the index.
-    if let Err(e) = src_backend.remove(&row.location.backend_path) {
-        warn!(
-            "migrate {} src-unlink failed: {:?}",
-            logical.display(),
-            e
-        );
+    // swap_location handles the columns; we need a separate write for
+    // replicas, but the cleanest is a full row replace via insert.
+    let mut full_row = row.clone();
+    full_row.location = new_loc;
+    full_row.replicas = replicas;
+    full_row.state = crate::index::FileState::Stable;
+    index.insert(full_row)?;
+
+    // 4. Best-effort source unlink. Orphans cleaned by startup scrub /
+    //    fsck. For mirror migration the "source" can itself be one of the
+    //    destinations (same tier replication); we never delete in that case.
+    let src_is_dst = written.iter().any(|d| Arc::ptr_eq(src_backend, d));
+    if !src_is_dst {
+        if let Err(e) = src_backend.remove(&row.location.backend_path) {
+            warn!("migrate {} src-unlink failed: {:?}", logical.display(), e);
+        }
     }
 
     Ok(true)
@@ -492,6 +538,7 @@ mod tests {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            replicas: Vec::new(),
         }
     }
 

@@ -92,6 +92,16 @@ impl Response {
     }
 }
 
+/// One file whose declared replica list doesn't match what's actually on
+/// the backends. `expected` = backends per the index `replicas` column;
+/// `missing` = subset of `expected` that returned `exists()=false`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ReplicaInconsistency {
+    pub path: PathBuf,
+    pub expected: Vec<String>,
+    pub missing: Vec<String>,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum ResponseData {
@@ -111,11 +121,13 @@ pub enum ResponseData {
     },
     /// `freeze` / `unfreeze`: confirms new state.
     FreezeState { frozen: bool },
-    /// `fsck` response: list of orphans (on disk, not in index) and ghosts
-    /// (in index, not on disk).
+    /// `fsck` response: orphans (on disk, not in index), ghosts (in index,
+    /// not on disk), and replica inconsistencies (D23: file claims N
+    /// replicas, but ≤ N actually exist on the relevant backends).
     Fsck {
         orphans: Vec<PathBuf>,
         ghosts: Vec<PathBuf>,
+        inconsistencies: Vec<ReplicaInconsistency>,
         repaired: usize,
     },
     /// `rescan` response.

@@ -42,6 +42,21 @@ pub struct TierMap {
     /// rhss runs as a two-tier system (existing v2.3 behavior).
     #[serde(default)]
     pub archive: Vec<ArchiveBackendConfig>,
+
+    /// Per-tier placement policy. Empty/absent = default (`most_free`).
+    /// Currently we honor `fast_policy`, `slow_policy`, `archive_policy`.
+    #[serde(default, rename = "fast_policy")]
+    pub fast_policy: Option<TierPolicy>,
+    #[serde(default, rename = "slow_policy")]
+    pub slow_policy: Option<TierPolicy>,
+    #[serde(default, rename = "archive_policy")]
+    pub archive_policy: Option<TierPolicy>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct TierPolicy {
+    /// `most_free` (default), `round_robin`, or `mirror`.
+    pub placement: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

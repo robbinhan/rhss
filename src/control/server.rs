@@ -16,7 +16,7 @@ use crate::scan;
 use crate::tier::TierRouter;
 use crate::tierer::{migrate, OpenFileTracker, TiererHandle};
 
-use super::protocol::{Request, Response, ResponseData};
+use super::protocol::{ReplicaInconsistency, Request, Response, ResponseData};
 
 /// Compute the canonical socket path next to the index db.
 ///
@@ -238,6 +238,7 @@ fn op_freeze(ctx: &OpContext, paused: bool) -> Response {
 fn op_fsck(ctx: &OpContext, repair: bool) -> Response {
     let mut orphans: Vec<PathBuf> = Vec::new();
     let mut ghosts: Vec<PathBuf> = Vec::new();
+    let mut inconsistencies: Vec<ReplicaInconsistency> = Vec::new();
     let mut repaired = 0usize;
 
     // Build map of logical_path → location from index.
@@ -281,6 +282,42 @@ fn op_fsck(ctx: &OpContext, repair: bool) -> Response {
                 }
             }
         }
+
+        // D7: replica inconsistency — check every replica listed in the
+        // index actually exists on its backend. Detection only; no auto-
+        // repair (that would need to know which replica is authoritative,
+        // and we don't have a per-replica hash yet).
+        if !row.replicas.is_empty() {
+            let mut missing: Vec<String> = Vec::new();
+            for rep in &row.replicas {
+                let ok = ctx
+                    .router
+                    .resolve_backend(row.location.tier, &rep.backend_id)
+                    .and_then(|b| b.exists(&rep.backend_path).ok())
+                    .unwrap_or(false);
+                if !ok {
+                    missing.push(rep.backend_id.clone());
+                }
+                if let Some(b) = ctx
+                    .router
+                    .resolve_backend(row.location.tier, &rep.backend_id)
+                {
+                    if ok {
+                        indexed_by_backend
+                            .entry((row.location.tier, b.id().to_string()))
+                            .or_default()
+                            .insert(rep.backend_path.clone());
+                    }
+                }
+            }
+            if !missing.is_empty() {
+                inconsistencies.push(ReplicaInconsistency {
+                    path: row.logical_path.clone(),
+                    expected: row.replicas.iter().map(|r| r.backend_id.clone()).collect(),
+                    missing,
+                });
+            }
+        }
     }
 
     // Orphans: walk each backend, anything not in indexed set.
@@ -297,6 +334,7 @@ fn op_fsck(ctx: &OpContext, repair: bool) -> Response {
     Response::ok_data(ResponseData::Fsck {
         orphans,
         ghosts,
+        inconsistencies,
         repaired,
     })
 }

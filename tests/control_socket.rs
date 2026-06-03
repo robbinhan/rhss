@@ -135,6 +135,7 @@ fn pin_then_unpin_roundtrips() {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            replicas: Vec::new(),
         })
         .unwrap();
 
@@ -202,6 +203,7 @@ fn migrate_moves_an_indexed_file() {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            replicas: Vec::new(),
         })
         .unwrap();
 
@@ -232,10 +234,12 @@ fn fsck_finds_orphan() {
         Some(ResponseData::Fsck {
             orphans,
             ghosts,
+            inconsistencies,
             repaired,
         }) => {
             assert_eq!(repaired, 0);
             assert!(ghosts.is_empty());
+            assert!(inconsistencies.is_empty());
             assert!(orphans.iter().any(|p| p.ends_with("rogue.bin")));
         }
         other => panic!("expected Fsck, got {other:?}"),
