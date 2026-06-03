@@ -13,6 +13,7 @@ use tracing::{error, info, warn};
 
 use crate::access::AccessTracker;
 use crate::backend::Backend;
+use crate::control::{socket_path_for, server::OpContext, ControlServer};
 use crate::error::Result;
 use crate::fuse::FuseConfig;
 use crate::index::{PathIndex, SqlitePathIndex, TierId};
@@ -135,6 +136,24 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
     );
     info!("background tierer started");
 
+    // Control socket — CLI commands (`rhss pin/oneshot/...`) talk to this.
+    let control_server = match ControlServer::start(
+        socket_path_for(&cfg.db),
+        OpContext {
+            router: Arc::clone(&router),
+            index: Arc::clone(&index),
+            open_tracker: Arc::clone(&open_tracker),
+            tierer: tierer_handle.clone(),
+            config_db_path: cfg.db.clone(),
+        },
+    ) {
+        Ok(srv) => Some(srv),
+        Err(e) => {
+            warn!("control socket disabled: {e}");
+            None
+        }
+    };
+
     let adapter = FuseAdapter::new(
         Arc::clone(&router),
         Arc::clone(&index),
@@ -174,6 +193,7 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
 
     info!("stopping adapter");
     adapter.stop();
+    drop(control_server);
     drop(session);
 
     std::thread::sleep(Duration::from_millis(200));

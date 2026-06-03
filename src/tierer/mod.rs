@@ -165,6 +165,7 @@ fn copy_streaming(
 pub struct Tierer {
     tx: Sender<TierMessage>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
     handle: Option<std::thread::JoinHandle<()>>,
 }
 
@@ -179,6 +180,7 @@ enum TierMessage {
 pub struct TiererHandle {
     tx: Sender<TierMessage>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 }
 
 impl TiererHandle {
@@ -201,6 +203,17 @@ impl TiererHandle {
         }
         true
     }
+
+    /// Pause/resume the background tierer. While paused, the loop wakes up
+    /// on its period but skips the eviction pass. `oneshot` requests are
+    /// also no-ops while paused (so an ENOSPC retry can't sneak past).
+    pub fn set_paused(&self, paused: bool) {
+        self.paused.store(paused, Ordering::SeqCst);
+    }
+
+    pub fn is_paused(&self) -> bool {
+        self.paused.load(Ordering::SeqCst)
+    }
 }
 
 impl Tierer {
@@ -212,19 +225,44 @@ impl Tierer {
     ) -> (Self, TiererHandle) {
         let (tx, rx) = bounded::<TierMessage>(16);
         let busy = Arc::new(AtomicBool::new(false));
+        let paused = Arc::new(AtomicBool::new(false));
         let busy_for_thread = Arc::clone(&busy);
+        let paused_for_thread = Arc::clone(&paused);
         let handle = std::thread::Builder::new()
             .name("rhss-tierer".into())
-            .spawn(move || tierer_loop(router, index, open_tracker, policy, rx, busy_for_thread))
+            .spawn(move || {
+                tierer_loop(
+                    router,
+                    index,
+                    open_tracker,
+                    policy,
+                    rx,
+                    busy_for_thread,
+                    paused_for_thread,
+                )
+            })
             .expect("spawn tierer");
-        let h = TiererHandle { tx: tx.clone(), busy: Arc::clone(&busy) };
-        (Self { tx, busy, handle: Some(handle) }, h)
+        let h = TiererHandle {
+            tx: tx.clone(),
+            busy: Arc::clone(&busy),
+            paused: Arc::clone(&paused),
+        };
+        (
+            Self {
+                tx,
+                busy,
+                paused,
+                handle: Some(handle),
+            },
+            h,
+        )
     }
 
     pub fn handle(&self) -> TiererHandle {
         TiererHandle {
             tx: self.tx.clone(),
             busy: Arc::clone(&self.busy),
+            paused: Arc::clone(&self.paused),
         }
     }
 }
@@ -245,6 +283,7 @@ fn tierer_loop(
     policy: Arc<dyn TieringPolicy>,
     rx: Receiver<TierMessage>,
     busy: Arc<AtomicBool>,
+    paused: Arc<AtomicBool>,
 ) {
     let mut last_full_sweep = Instant::now();
     let day = Duration::from_secs(86_400);
@@ -279,6 +318,11 @@ fn tierer_loop(
                 Ok(TierMessage::Oneshot) => {}
                 Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
             }
+        }
+
+        if paused.load(Ordering::SeqCst) {
+            debug!("tierer: paused — skipping eviction pass");
+            continue;
         }
 
         busy.store(true, Ordering::SeqCst);

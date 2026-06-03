@@ -6,6 +6,7 @@ pub mod access;
 pub mod backend;
 pub mod cli;
 pub mod config;
+pub mod control;
 pub mod error;
 pub mod fuse;
 pub mod index;
