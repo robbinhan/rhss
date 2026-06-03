@@ -27,6 +27,16 @@
 | **HA / failover** | 不做 | 单机单进程设计 |
 | **加密静态数据** | v0.3 | macOS APFS 自带 FileVault 即可;Linux 上接 LUKS 在 backend 下层 |
 
+## 候选(借鉴外部产品的灵感)
+
+> 调研过的外部产品在我们已有抽象之上能延伸出哪些方向。这里只记**候选**,不承诺做。
+
+| 编号 | 候选项 | 来源 / 借鉴 | 评估时点 | 大致方案 |
+|---|---|---|---|---|
+| 候选-A | **S3 / 对象存储 backend 作为第三层 archive** | HydraDB 三层(memory / SSD / object)启发 | v0.3 评估 | 已有 `Backend` trait,实现 `S3Backend`(`s3` / `object_store` crate);配置加 `[[tier.archive]] endpoint=... storage_class=...`;迁移策略加 `min_age_to_archive`(默认 365 天);FUSE `open` 处理"解冻"等待 + 状态显示。预计 ~2 周 |
+| 候选-B | **文件 mutability 列 + 利用其做分层决策** | HydraDB Memories vs Knowledge 二分启发 | v0.4 评估 | `PathIndex` 加列 `mutability TEXT CHECK ('mutable','immutable','unknown')`;来源:`chflags uchg` / `chattr +i` 显式标记 + 连续 N 天 mtime 不变自动转 immutable;immutable 文件可激进下沉、可在 Slow 层做 zstd 压缩/去重。预计 ~1 周 |
+| 候选-C | **per-backend `cost_per_gb_month` + 成本感知 placement** | HydraDB 按存储分层定价启发 | v0.5 评估 | `BackendStats` 加 `cost_per_gb_month: Option<f64>`;配置每个 backend 可选声明成本;新增 `CostAwarePlacement`(对成本敏感时优先便宜的 backend,反之 fallback 到 `MostFreePlacement`)。预计 ~3 天,trait 已支持 |
+
 ## 跑偏检测清单(每周 review)
 
 - [ ] 是否有任何 D 项被静默修改而没更新 [decisions.md](./decisions.md)?
