@@ -23,7 +23,17 @@ use crate::index::{Location, PathIndex, ReplicaLoc, TierId};
 use crate::policy::TieringPolicy;
 use crate::tier::TierRouter;
 
+fn compressed_or_raw(path: &Path, compressed: bool) -> std::path::PathBuf {
+    if compressed {
+        compress::compressed_path(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub mod compress;
 pub mod open_tracker;
+pub use compress::{compress_between, ensure_decompressed, hash_file};
 pub use open_tracker::OpenFileTracker;
 
 const COPY_BUF_SIZE: usize = 1 << 20; // 1 MiB chunks
@@ -75,40 +85,59 @@ pub fn migrate(
 
     let dst_path = row.location.backend_path.clone();
 
-    // 1. Stream-copy src -> all dst backends. On any failure, roll back
-    //    every dst write we already did (best-effort delete), then bail.
+    // D24: compress immutable files when demoting to Slow. (Archive
+    // compression is left for v2 — S3 already does TLS+content-type
+    // negotiation and the latency cost of compress-on-PUT is unclear.)
+    let should_compress = row.mutability == crate::index::Mutability::Immutable
+        && target_tier == TierId::Slow;
+    let mut new_hash: Option<String> = row.content_hash.clone();
+
+    // 1. Copy src -> all dst backends (compressed or raw). Roll back any
+    //    failure.
     let mut written: Vec<&Arc<dyn Backend>> = Vec::with_capacity(dst_backends.len());
     for dst in &dst_backends {
-        if let Err(e) = copy_streaming(src_backend, &row.location.backend_path, dst, &dst_path) {
+        let copy_result = if should_compress {
+            compress_between(src_backend, &row.location.backend_path, dst, &dst_path)
+                .map(|h| {
+                    new_hash = Some(h);
+                })
+        } else {
+            copy_streaming(src_backend, &row.location.backend_path, dst, &dst_path)
+        };
+        if let Err(e) = copy_result {
             warn!(
                 "migrate {} replica {} failed; rolling back",
                 logical.display(),
                 dst.id()
             );
             for already in &written {
-                let _ = already.remove(&dst_path);
+                let _ = already.remove(&compressed_or_raw(&dst_path, should_compress));
             }
             return Err(e);
         }
-        if let Err(e) = dst.fsync(&dst_path) {
+        let actual_path = compressed_or_raw(&dst_path, should_compress);
+        if let Err(e) = dst.fsync(&actual_path) {
             warn!(
                 "migrate {} replica {} fsync failed; rolling back",
                 logical.display(),
                 dst.id()
             );
-            let _ = dst.remove(&dst_path);
+            let _ = dst.remove(&actual_path);
             for already in &written {
-                let _ = already.remove(&dst_path);
+                let _ = already.remove(&compressed_or_raw(&dst_path, should_compress));
             }
             return Err(e);
         }
         written.push(dst);
     }
 
-    // 2. Preserve atime/mtime on every replica (D16).
+    // 2. Preserve atime/mtime on every replica (D16). Use the actual
+    //    on-disk path (`.zst` suffix if compressed) since set_times needs
+    //    to find the file.
     if let Ok(orig_meta) = src_backend.metadata(&row.location.backend_path) {
+        let actual = compressed_or_raw(&dst_path, should_compress);
         for dst in &written {
-            let _ = dst.set_times(&dst_path, Some(orig_meta.atime), Some(orig_meta.mtime));
+            let _ = dst.set_times(&actual, Some(orig_meta.atime), Some(orig_meta.mtime));
         }
     }
 
@@ -137,6 +166,10 @@ pub fn migrate(
     full_row.location = new_loc;
     full_row.replicas = replicas;
     full_row.state = crate::index::FileState::Stable;
+    full_row.compressed = should_compress;
+    if let Some(h) = new_hash {
+        full_row.content_hash = Some(h);
+    }
     index.insert(full_row)?;
 
     // 4. Best-effort source unlink. Orphans cleaned by startup scrub /
