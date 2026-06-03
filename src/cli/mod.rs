@@ -12,6 +12,7 @@ use crate::error::Result;
 
 pub mod common;
 pub mod config_cmd;
+pub mod control;
 pub mod inspect;
 pub mod mount_cmd;
 pub mod status;
@@ -65,6 +66,35 @@ pub enum Cmd {
     /// All files with `pinned_tier` set.
     ListPinned,
 
+    // === control (require daemon) ===
+
+    /// Pin a file to a tier so the tierer never evicts it.
+    Pin(PinArgs),
+
+    /// Clear a file's tier pin.
+    Unpin(WhichArgs),
+
+    /// Trigger one tier-eviction cycle immediately.
+    Oneshot(OneshotArgs),
+
+    /// Force a single file to a specific tier.
+    Migrate(MigrateArgs),
+
+    /// Pause the background tierer.
+    Freeze,
+
+    /// Resume the background tierer.
+    Unfreeze,
+
+    /// Check index/backend consistency. Lists orphans + ghosts.
+    Fsck(FsckArgs),
+
+    /// Re-scan backends to ingest newly-dropped files.
+    Rescan,
+
+    /// Health-check the control socket.
+    Ping,
+
     // === config ===
 
     #[command(subcommand)]
@@ -93,6 +123,39 @@ pub struct TopArgs {
     /// Restrict to one tier.
     #[arg(long, value_enum)]
     pub tier: Option<TierArg>,
+}
+
+#[derive(Args, Debug)]
+pub struct PinArgs {
+    /// Logical path inside the mount.
+    pub path: PathBuf,
+    /// Which tier to pin to. Defaults to fast.
+    #[arg(long, value_enum, default_value_t = TierArg::Fast)]
+    pub tier: TierArg,
+}
+
+#[derive(Args, Debug)]
+pub struct OneshotArgs {
+    /// Block until the tier cycle finishes (up to 60s).
+    #[arg(long, default_value_t = false)]
+    pub wait: bool,
+}
+
+#[derive(Args, Debug)]
+pub struct MigrateArgs {
+    /// Logical path inside the mount.
+    pub path: PathBuf,
+    /// Target tier.
+    #[arg(long = "to", value_enum)]
+    pub to: TierArg,
+}
+
+#[derive(Args, Debug)]
+pub struct FsckArgs {
+    /// Apply repairs: delete ghost index rows, leave orphans untouched
+    /// (orphans need user judgment — could be temp files or new ingests).
+    #[arg(long, default_value_t = false)]
+    pub repair: bool,
 }
 
 #[derive(Subcommand, Debug)]
@@ -142,6 +205,15 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Hottest(args) => inspect::hottest(&ctx, args),
         Cmd::Coldest(args) => inspect::coldest(&ctx, args),
         Cmd::ListPinned => inspect::list_pinned(&ctx),
+        Cmd::Pin(args) => control::pin(&ctx, args),
+        Cmd::Unpin(args) => control::unpin(&ctx, args),
+        Cmd::Oneshot(args) => control::oneshot(&ctx, args),
+        Cmd::Migrate(args) => control::migrate(&ctx, args),
+        Cmd::Freeze => control::freeze(&ctx, true),
+        Cmd::Unfreeze => control::freeze(&ctx, false),
+        Cmd::Fsck(args) => control::fsck(&ctx, args),
+        Cmd::Rescan => control::rescan(&ctx),
+        Cmd::Ping => control::ping(&ctx),
         Cmd::Config(c) => config_cmd::run(&ctx, c),
     }
 }

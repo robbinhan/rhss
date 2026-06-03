@@ -114,7 +114,8 @@ mod tests {
     fn initial_popularity_is_nonzero() {
         // D17: new files must NOT start at 0, else they'd be the coldest
         // and immediately driven to slow.
-        assert!(INITIAL_POPULARITY > 0.0);
+        let p = INITIAL_POPULARITY;
+        assert!(p > 0.0);
     }
 
     #[test]
