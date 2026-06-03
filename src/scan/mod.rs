@@ -119,6 +119,7 @@ fn scan_one(
                 backend_path: rel.clone(),
                 size: meta.size,
             },
+            replicas: Vec::new(),
             last_access: meta.mtime,
             hit_count: 0,
             popularity: 0.0,

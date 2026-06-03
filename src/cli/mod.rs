@@ -66,6 +66,9 @@ pub enum Cmd {
     /// All files with `pinned_tier` set.
     ListPinned,
 
+    /// All replica locations for a file (mirror tiers).
+    Replicas(WhichArgs),
+
     // === control (require daemon) ===
 
     /// Pin a file to a tier so the tierer never evicts it.
@@ -207,6 +210,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Hottest(args) => inspect::hottest(&ctx, args),
         Cmd::Coldest(args) => inspect::coldest(&ctx, args),
         Cmd::ListPinned => inspect::list_pinned(&ctx),
+        Cmd::Replicas(args) => inspect::replicas(&ctx, args),
         Cmd::Pin(args) => control::pin(&ctx, args),
         Cmd::Unpin(args) => control::unpin(&ctx, args),
         Cmd::Oneshot(args) => control::oneshot(&ctx, args),

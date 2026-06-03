@@ -196,6 +196,37 @@ impl FuseState {
         Some((Arc::clone(backend), loc.backend_path))
     }
 
+    /// Like `resolve`, but considers replicas when the primary backend
+    /// can't satisfy `exists()`. Used by FUSE `open` so a downed S3 replica
+    /// doesn't break access if another replica is reachable. Slightly more
+    /// expensive than `resolve` (full row + extra exists check) — only call
+    /// on cold paths (open, lookup), not on every read/write.
+    fn resolve_with_fallback(&self, logical: &Path) -> Option<(Arc<dyn Backend>, PathBuf)> {
+        let row = self.index.get(logical).ok().flatten()?;
+        // Try primary first.
+        if let Some(primary) = self.router.resolve_backend(row.location.tier, &row.location.backend_id) {
+            if primary.exists(&row.location.backend_path).unwrap_or(false) {
+                return Some((Arc::clone(primary), row.location.backend_path));
+            }
+        }
+        // Then each replica in order. Skip the primary (already tried).
+        for rep in &row.replicas {
+            if rep.backend_id == row.location.backend_id {
+                continue;
+            }
+            if let Some(b) = self.router.resolve_backend(row.location.tier, &rep.backend_id) {
+                if b.exists(&rep.backend_path).unwrap_or(false) {
+                    debug!(
+                        "open replica fallback: {} → {}",
+                        row.location.backend_id, rep.backend_id
+                    );
+                    return Some((Arc::clone(b), rep.backend_path.clone()));
+                }
+            }
+        }
+        None
+    }
+
     fn allocate_fh(&self, entry: FhEntry) -> u64 {
         let fh = self.next_fh.fetch_add(1, Ordering::SeqCst);
         self.fh_table.lock().insert(fh, entry);
@@ -474,14 +505,11 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
-        let Some((backend, bpath)) = self.state.resolve(&logical) else {
+        // D5: try primary, then replicas (mirror tiers).
+        let Some((backend, bpath)) = self.state.resolve_with_fallback(&logical) else {
             reply.error(ENOENT);
             return;
         };
-        if let Err(e) = backend.exists(&bpath) {
-            reply.error(errno(&e));
-            return;
-        }
         self.state.open_tracker.register(&logical);
         let fh = self.state.allocate_fh(FhEntry {
             logical: logical.clone(),
@@ -571,6 +599,7 @@ impl Filesystem for FuseAdapter {
                 backend_path: rel.clone(),
                 size: meta.size,
             },
+            replicas: Vec::new(), // new files start single-replica; mirror is applied at first migrate
             last_access: SystemTime::now(),
             hit_count: 0,
             popularity: self.state.policy.initial_popularity(), // D17

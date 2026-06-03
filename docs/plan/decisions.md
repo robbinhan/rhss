@@ -30,7 +30,7 @@
 | D20 | **双层性能定位**:macOS 200-500 MB/s 顺序("个人桌面 / 家庭 NAS"),**Linux 1-3 GB/s 顺序**("轻量服务器 / 工作站存储后端") | Linux FUSE3 有 splice / writeback cache / 大 buffer / 多线程派发等 macFUSE 不具备的优化点,代价小(约 +2 周)且能让 rhss 真正进入"服务器场景可用"区间。注意:GB/s 仅对顺序/流式负载,小文件随机 IOPS 仍是 FUSE 上限(50-150K) |
 | D21 | **Linux 性能基准做成 CI 强制项** | 设阈值:`fio` 4K 随机读 IOPS > 50K、顺序读吞吐 > 1 GB/s。低于阈值红灯。挡住后续修改的隐性性能回归 |
 | D22 | **第三层 Archive(S3 兼容对象存储),可选** | 候选-A 已落地。`TierId::Archive` + `[[tier.archive]]` 配置;rust-s3 sync HTTP,不重新引入 tokio;读经 staging cache(`<db.parent>/.rhss_staging/<id>/`);写在 fsync 时 PUT;凭据从 env vars 读(配置只写 env var name)。默认 storage_class=STANDARD 适配 R2/B2;AWS 用户可选 STANDARD_IA/GLACIER 等。Tierer 链式驱逐:Fast→Slow 触发 `low_watermark`(60%),Slow→Archive 触发 `slow_archive_watermark`(80%)且文件 `min_age_to_archive`(默认 365 天)未访问 |
-| D23 | **多副本(MirrorPlacement)/ thaw / Glacier 异步取回 留 v2** | D22 的 MVP 单副本;trait 已预留扩展位:加 `Placement::pick_all() -> Vec<&Backend>`、Tierer 的 `migrate()` 改成并发 N-write 即可。Glacier 类需要 thaw 命令 + 后台轮询取回状态,语义较重,独立 PR |
+| D23 | **多副本(MirrorPlacement)已落地;thaw / Glacier 异步取回 留 v2** | 实现:`Placement::pick_all`(默认返回 `vec![pick()?]`)+ `MirrorPlacement`(返回所有);`PathIndex` 加 `replicas TEXT`(JSON 数组,可空,Idempotent 迁移);`migrate()` 多副本写入 + 任一失败回滚;FUSE `open` 走 `resolve_with_fallback`(primary 不在再试 replicas);`rhss replicas <path>` CLI 列出全部副本;`fsck` 检测 replica 缺失。**未做(留 v2)**:mid-stream 读 fallback、`fsck --repair-replicas` 自动补副本、Erasure Coding、thaw 命令 |
 
 ## 决策变更流程
 

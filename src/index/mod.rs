@@ -56,12 +56,35 @@ pub struct Location {
     pub size: u64,
 }
 
+/// One replica's (backend_id, backend_path). Used by the `replicas` JSON
+/// column to record N copies of a file across backends in the same tier.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct ReplicaLoc {
+    pub backend_id: String,
+    pub backend_path: PathBuf,
+}
+
+impl ReplicaLoc {
+    pub fn new(backend_id: impl Into<String>, backend_path: impl Into<PathBuf>) -> Self {
+        Self {
+            backend_id: backend_id.into(),
+            backend_path: backend_path.into(),
+        }
+    }
+}
+
 /// A row in the index. `last_access` is unix epoch seconds; `popularity` is
 /// the EMA score (filled in by P2).
 #[derive(Debug, Clone)]
 pub struct FileRow {
     pub logical_path: PathBuf,
+    /// "Primary" location — kept as a column for back-compat, used by code
+    /// paths that don't care about replication. Always equal to
+    /// `replicas[0]` when `replicas` is non-empty.
     pub location: Location,
+    /// Empty = single-replica (legacy). Non-empty = N replicas, all on the
+    /// same tier as `location.tier`. `location` is always one of these.
+    pub replicas: Vec<ReplicaLoc>,
     pub last_access: SystemTime,
     pub hit_count: u64,
     pub popularity: f64,
@@ -166,10 +189,42 @@ impl SqlitePathIndex {
         )
         .map_err(|e| FsError::Storage(format!("init schema: {e}")))?;
 
+        // D23 migration: add `replicas` column if not present. Idempotent.
+        Self::migrate_add_replicas(&conn)?;
+
         Ok(Arc::new(Self {
             inner: Mutex::new(conn),
             cache: Mutex::new(LruCache::new(NonZeroUsize::new(4096).unwrap())),
         }))
+    }
+
+    fn migrate_add_replicas(conn: &Connection) -> Result<()> {
+        // PRAGMA table_info returns (cid, name, type, notnull, dflt, pk).
+        let has_col: bool = {
+            let mut stmt = conn
+                .prepare("PRAGMA table_info(files)")
+                .map_err(|e| FsError::Storage(format!("pragma: {e}")))?;
+            let mut rows = stmt
+                .query([])
+                .map_err(|e| FsError::Storage(format!("pragma query: {e}")))?;
+            let mut found = false;
+            while let Some(r) = rows
+                .next()
+                .map_err(|e| FsError::Storage(format!("pragma row: {e}")))?
+            {
+                let name: String = r.get(1).unwrap_or_default();
+                if name == "replicas" {
+                    found = true;
+                    break;
+                }
+            }
+            found
+        };
+        if !has_col {
+            conn.execute("ALTER TABLE files ADD COLUMN replicas TEXT", [])
+                .map_err(|e| FsError::Storage(format!("add replicas col: {e}")))?;
+        }
+        Ok(())
     }
 
     fn put_cache(&self, logical: &Path, loc: Location) {
@@ -230,7 +285,7 @@ impl PathIndex for SqlitePathIndex {
         let conn = self.inner.lock();
         let row = conn
             .query_row(
-                "SELECT tier, backend_id, backend_path, size, last_access, hit_count, popularity, pinned_tier, state
+                "SELECT tier, backend_id, backend_path, size, last_access, hit_count, popularity, pinned_tier, state, replicas
                  FROM files WHERE logical_path = ?1",
                 params![logical.to_string_lossy().as_ref()],
                 |r| {
@@ -244,16 +299,19 @@ impl PathIndex for SqlitePathIndex {
                         r.get::<_, f64>(6)?,
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, String>(8)?,
+                        r.get::<_, Option<String>>(9)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| FsError::Storage(format!("get: {e}")))?;
-        let Some((tier, backend_id, backend_path, size, atime, hits, pop, pinned, state)) = row
+        let Some((tier, backend_id, backend_path, size, atime, hits, pop, pinned, state, replicas)) =
+            row
         else {
             return Ok(None);
         };
         let pinned_tier = pinned.map(|s| TierId::parse(&s)).transpose()?;
+        let replicas = parse_replicas(replicas)?;
         Ok(Some(FileRow {
             logical_path: logical.to_path_buf(),
             location: Location {
@@ -262,6 +320,7 @@ impl PathIndex for SqlitePathIndex {
                 backend_path: PathBuf::from(backend_path),
                 size: size as u64,
             },
+            replicas,
             last_access: ts_from_secs(atime),
             hit_count: hits as u64,
             popularity: pop,
@@ -272,11 +331,12 @@ impl PathIndex for SqlitePathIndex {
 
     fn insert(&self, row: FileRow) -> Result<()> {
         let conn = self.inner.lock();
+        let replicas_json = serialize_replicas(&row.replicas)?;
         conn.execute(
             "INSERT OR REPLACE INTO files
              (logical_path, tier, backend_id, backend_path, size, last_access,
-              hit_count, popularity, pinned_tier, state)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+              hit_count, popularity, pinned_tier, state, replicas)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
             params![
                 row.logical_path.to_string_lossy().as_ref(),
                 row.location.tier.as_str(),
@@ -288,6 +348,7 @@ impl PathIndex for SqlitePathIndex {
                 row.popularity,
                 row.pinned_tier.map(|t| t.as_str()),
                 row.state.as_str(),
+                replicas_json,
             ],
         )
         .map_err(|e| FsError::Storage(format!("insert: {e}")))?;
@@ -416,7 +477,7 @@ impl PathIndex for SqlitePathIndex {
             (
                 format!(
                     "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                            hit_count, popularity, pinned_tier, state
+                            hit_count, popularity, pinned_tier, state, replicas
                        FROM files WHERE tier = ?1
                        ORDER BY popularity {order}, last_access {order}
                        LIMIT ?2"
@@ -427,7 +488,7 @@ impl PathIndex for SqlitePathIndex {
             (
                 format!(
                     "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                            hit_count, popularity, pinned_tier, state
+                            hit_count, popularity, pinned_tier, state, replicas
                        FROM files
                        ORDER BY popularity {order}, last_access {order}
                        LIMIT ?1"
@@ -483,7 +544,7 @@ impl PathIndex for SqlitePathIndex {
         let mut stmt = conn
             .prepare(
                 "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                        hit_count, popularity, pinned_tier, state
+                        hit_count, popularity, pinned_tier, state, replicas
                    FROM files
                    WHERE pinned_tier IS NOT NULL
                    ORDER BY logical_path",
@@ -509,6 +570,7 @@ type RawRow = (
     f64,            // popularity
     Option<String>, // pinned_tier
     String,         // state
+    Option<String>, // replicas JSON
 );
 
 fn parse_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
@@ -523,12 +585,14 @@ fn parse_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         r.get(7)?,
         r.get(8)?,
         r.get(9)?,
+        r.get(10)?,
     ))
 }
 
 fn row_to_file(raw: RawRow) -> Result<FileRow> {
-    let (lp, tier, bid, bpath, size, atime, hits, pop, pinned, state) = raw;
+    let (lp, tier, bid, bpath, size, atime, hits, pop, pinned, state, replicas) = raw;
     let pinned_tier = pinned.map(|s| TierId::parse(&s)).transpose()?;
+    let replicas = parse_replicas(replicas)?;
     Ok(FileRow {
         logical_path: PathBuf::from(lp),
         location: Location {
@@ -537,12 +601,31 @@ fn row_to_file(raw: RawRow) -> Result<FileRow> {
             backend_path: PathBuf::from(bpath),
             size: size as u64,
         },
+        replicas,
         last_access: ts_from_secs(atime),
         hit_count: hits as u64,
         popularity: pop,
         pinned_tier,
         state: FileState::parse(&state)?,
     })
+}
+
+fn parse_replicas(s: Option<String>) -> Result<Vec<ReplicaLoc>> {
+    match s {
+        None => Ok(Vec::new()),
+        Some(json) if json.is_empty() => Ok(Vec::new()),
+        Some(json) => serde_json::from_str::<Vec<ReplicaLoc>>(&json)
+            .map_err(|e| FsError::Storage(format!("parse replicas: {e}"))),
+    }
+}
+
+fn serialize_replicas(rs: &[ReplicaLoc]) -> Result<Option<String>> {
+    if rs.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(
+        serde_json::to_string(rs).map_err(|e| FsError::Storage(format!("ser replicas: {e}")))?,
+    ))
 }
 
 #[cfg(test)]
@@ -564,6 +647,7 @@ mod tests {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            replicas: Vec::new(),
         }
     }
 
