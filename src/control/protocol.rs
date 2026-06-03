@@ -16,6 +16,7 @@ use crate::index::TierId as IndexTierId;
 pub enum Tier {
     Fast,
     Slow,
+    Archive,
 }
 
 impl From<Tier> for IndexTierId {
@@ -23,6 +24,7 @@ impl From<Tier> for IndexTierId {
         match t {
             Tier::Fast => IndexTierId::Fast,
             Tier::Slow => IndexTierId::Slow,
+            Tier::Archive => IndexTierId::Archive,
         }
     }
 }
@@ -32,6 +34,7 @@ impl From<IndexTierId> for Tier {
         match t {
             IndexTierId::Fast => Tier::Fast,
             IndexTierId::Slow => Tier::Slow,
+            IndexTierId::Archive => Tier::Archive,
         }
     }
 }

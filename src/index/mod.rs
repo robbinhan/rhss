@@ -15,29 +15,36 @@ use rusqlite::{params, Connection, OptionalExtension};
 
 use crate::error::{FsError, Result};
 
-/// Which tier a file is on. The names are physical (Fast = SSD-ish,
-/// Slow = HDD-ish), not policy ("hot/cold").
+/// Which tier a file is on. Names are physical (Fast = SSD-ish, Slow =
+/// HDD-ish, Archive = object storage / S3-ish), not policy ("hot/cold").
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum TierId {
     Fast,
     Slow,
+    Archive,
 }
 
 impl TierId {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             TierId::Fast => "fast",
             TierId::Slow => "slow",
+            TierId::Archive => "archive",
         }
     }
 
-    fn parse(s: &str) -> Result<Self> {
+    pub fn parse(s: &str) -> Result<Self> {
         match s {
             "fast" => Ok(TierId::Fast),
             "slow" => Ok(TierId::Slow),
+            "archive" => Ok(TierId::Archive),
             other => Err(FsError::Storage(format!("unknown tier: {other}"))),
         }
     }
+
+    /// All declared tiers in coldest-to-hottest order. Used by callers
+    /// that want to iterate every tier (e.g. statfs aggregation, fsck).
+    pub const ALL: [TierId; 3] = [TierId::Fast, TierId::Slow, TierId::Archive];
 }
 
 /// Where exactly a file lives.
@@ -635,6 +642,24 @@ mod tests {
         let v = idx.coldest(TierId::Fast, 250, Duration::ZERO).unwrap();
         // First match >= 250 happens at 3rd entry (300 bytes).
         assert_eq!(v.len(), 3);
+    }
+
+    #[test]
+    fn tier_id_archive_round_trip() {
+        assert_eq!(TierId::parse("archive").unwrap(), TierId::Archive);
+        assert_eq!(TierId::Archive.as_str(), "archive");
+    }
+
+    #[test]
+    fn coldest_query_on_archive_tier_works() {
+        let (_d, idx) = open();
+        let mut row = make_row("/cold.bin", TierId::Archive, 1234);
+        row.last_access = SystemTime::UNIX_EPOCH; // very old
+        idx.insert(row).unwrap();
+        let v = idx
+            .coldest(TierId::Archive, 10_000, Duration::ZERO)
+            .unwrap();
+        assert_eq!(v.len(), 1);
     }
 
     #[test]

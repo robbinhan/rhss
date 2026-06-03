@@ -34,6 +34,9 @@ pub fn status(ctx: &CliContext) -> Result<()> {
     println!();
     print_capacity("Fast (SSD)", &router.fast);
     print_capacity("Slow (HDD)", &router.slow);
+    if let Some(arc) = &router.archive {
+        print_capacity("Archive (S3)", arc);
+    }
     println!();
     println!(
         "Indexed: {} files | Pinned: {}",
@@ -95,15 +98,23 @@ pub fn stats(ctx: &CliContext) -> Result<()> {
 
     let fast_phys = router.fast.capacity();
     let slow_phys = router.slow.capacity();
+    let arc_phys = router.archive.as_ref().map(|a| a.capacity());
+
+    let mut entries: Vec<(&str, (u64, u64, u64))> =
+        vec![("Fast", fast_phys), ("Slow", slow_phys)];
+    if let Some(p) = arc_phys {
+        entries.push(("Archive", p));
+    }
 
     if ctx.json {
+        let tiers: Vec<TierStats> = entries
+            .iter()
+            .map(|(name, phys)| tier_stats_json(name, &summaries, *phys))
+            .collect();
         let payload = StatsJson {
             indexed_total: total_files,
             pinned_count,
-            tiers: vec![
-                tier_stats_json("Fast", &summaries, fast_phys),
-                tier_stats_json("Slow", &summaries, slow_phys),
-            ],
+            tiers,
         };
         println!("{}", serde_json::to_string_pretty(&payload)?);
         return Ok(());
@@ -113,13 +124,13 @@ pub fn stats(ctx: &CliContext) -> Result<()> {
     println!("Pinned:        {}", pinned_count);
     println!();
     println!(
-        "{:<6}  {:>12}  {:>12}  {:>12}  {:>12}",
+        "{:<8}  {:>12}  {:>12}  {:>12}  {:>12}",
         "TIER", "FILES", "INDEXED", "DISK USED", "DISK TOTAL"
     );
-    for (name, phys) in [("Fast", fast_phys), ("Slow", slow_phys)] {
+    for (name, phys) in entries {
         let (n, indexed_bytes) = sum_for(&summaries, parse_name(name));
         println!(
-            "{:<6}  {:>12}  {:>12}  {:>12}  {:>12}",
+            "{:<8}  {:>12}  {:>12}  {:>12}  {:>12}",
             name,
             format_count(n),
             fmt_bytes(indexed_bytes),
@@ -152,12 +163,14 @@ fn tier_name(t: TierId) -> &'static str {
     match t {
         TierId::Fast => "Fast",
         TierId::Slow => "Slow",
+        TierId::Archive => "Archive",
     }
 }
 
 fn parse_name(name: &str) -> TierId {
     match name {
         "Fast" => TierId::Fast,
+        "Archive" => TierId::Archive,
         _ => TierId::Slow,
     }
 }
@@ -232,7 +245,12 @@ fn tier_blocks(
     _summaries: &[(TierId, u64, u64)],
 ) -> Vec<TierBlock> {
     let mut tiers = Vec::new();
-    for (name, tier) in [("Fast", &router.fast), ("Slow", &router.slow)] {
+    let mut named: Vec<(&'static str, &crate::tier::Tier)> =
+        vec![("Fast", &router.fast), ("Slow", &router.slow)];
+    if let Some(arc) = &router.archive {
+        named.push(("Archive", arc));
+    }
+    for (name, tier) in named {
         let mut backends = Vec::new();
         for b in &tier.backends {
             let s = b.statvfs().ok();

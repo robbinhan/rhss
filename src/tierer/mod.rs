@@ -62,7 +62,10 @@ pub fn migrate(
                 row.location.backend_id
             ))
         })?;
-    let dst_backend = router.tier(target_tier).pick()?;
+    let dst_backend = router
+        .tier(target_tier)
+        .ok_or_else(|| FsError::Storage(format!("target tier {:?} not configured", target_tier)))?
+        .pick()?;
 
     if Arc::ptr_eq(src_backend, dst_backend) {
         // Same backend — nothing to do.
@@ -342,14 +345,64 @@ fn evict_cold(
     open_tracker: &Arc<OpenFileTracker>,
     policy: &Arc<dyn TieringPolicy>,
 ) {
-    let usage = router.fast.usage_ratio();
-    if usage <= policy.low_watermark() {
+    // Chain 1: Fast → Slow on the usual watermarks.
+    evict_chain(
+        router,
+        index,
+        open_tracker,
+        TierId::Fast,
+        TierId::Slow,
+        policy.low_watermark(),
+        policy.high_watermark(),
+        policy.min_age_to_evict(),
+        || router.fast.capacity(),
+        || router.fast.usage_ratio(),
+    );
+
+    // Chain 2: Slow → Archive, only when an archive tier is configured.
+    if router.has_archive() {
+        // Use the archive-specific watermark + min-age. Same shape as chain 1
+        // but with the slow tier's capacity as the source.
+        let slow_usage = router.slow.usage_ratio();
+        if slow_usage > policy.slow_archive_watermark() {
+            // Bring slow back down to (slow_archive_watermark - 0.10).
+            let target_usage = (policy.slow_archive_watermark() - 0.10).max(0.0);
+            evict_chain(
+                router,
+                index,
+                open_tracker,
+                TierId::Slow,
+                TierId::Archive,
+                target_usage, // unused — we recompute to_free below
+                policy.slow_archive_watermark(),
+                policy.min_age_to_archive(),
+                || router.slow.capacity(),
+                || router.slow.usage_ratio(),
+            );
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn evict_chain(
+    router: &TierRouter,
+    index: &Arc<dyn PathIndex>,
+    open_tracker: &Arc<OpenFileTracker>,
+    src_tier: TierId,
+    dst_tier: TierId,
+    low_wm: f64,
+    high_wm: f64,
+    min_age: std::time::Duration,
+    capacity_fn: impl Fn() -> (u64, u64, u64),
+    usage_fn: impl Fn() -> f64,
+) {
+    let usage = usage_fn();
+    if usage <= low_wm {
         return;
     }
 
-    // Target free: bring usage back down to mid-point between low and high.
-    let target_usage = (policy.low_watermark() + policy.high_watermark()) / 2.0;
-    let (total, used, _free) = router.fast.capacity();
+    let target_usage = (low_wm + high_wm) / 2.0;
+    let (total, used, _free) = capacity_fn();
     let target_used = (total as f64 * target_usage) as u64;
     let to_free = used.saturating_sub(target_used);
     if to_free == 0 {
@@ -357,22 +410,23 @@ fn evict_cold(
     }
 
     info!(
+        chain = format!("{:?} -> {:?}", src_tier, dst_tier),
         usage = format!("{:.1}%", usage * 100.0),
         target_bytes = to_free,
-        "tierer: starting cold-eviction"
+        "tierer: starting eviction chain"
     );
 
-    let victims = match index.coldest(TierId::Fast, to_free, policy.min_age_to_evict()) {
+    let victims = match index.coldest(src_tier, to_free, min_age) {
         Ok(v) => v,
         Err(e) => {
-            warn!("coldest query: {:?}", e);
+            warn!("coldest query for {:?}: {:?}", src_tier, e);
             return;
         }
     };
 
     for (path, _size) in victims {
-        match migrate(router, index, open_tracker, &path, TierId::Slow) {
-            Ok(true) => debug!("evicted {}", path.display()),
+        match migrate(router, index, open_tracker, &path, dst_tier) {
+            Ok(true) => debug!("{:?} -> {:?}: {}", src_tier, dst_tier, path.display()),
             Ok(false) => debug!("skipped {} (open or pinned)", path.display()),
             Err(e) => warn!("migrate {}: {:?}", path.display(), e),
         }

@@ -22,6 +22,7 @@ lru = "0.12"
 toml = "0.8"
 walkdir = "2.5"
 crossbeam-channel = "0.5"
+rust-s3 = { version = "0.34", default-features = false, features = ["sync-native-tls"] }
 
 [dev-dependencies]
 tempfile = "3.8"

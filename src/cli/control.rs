@@ -88,6 +88,7 @@ impl From<super::TierArg> for crate::control::Tier {
         match t {
             super::TierArg::Fast => crate::control::Tier::Fast,
             super::TierArg::Slow => crate::control::Tier::Slow,
+            super::TierArg::Archive => crate::control::Tier::Archive,
         }
     }
 }

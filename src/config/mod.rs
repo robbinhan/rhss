@@ -38,12 +38,54 @@ pub struct RhssConfig {
 pub struct TierMap {
     pub fast: Vec<BackendConfig>,
     pub slow: Vec<BackendConfig>,
+    /// Third tier — S3-compatible object storage. Optional; when absent
+    /// rhss runs as a two-tier system (existing v2.3 behavior).
+    #[serde(default)]
+    pub archive: Vec<ArchiveBackendConfig>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
 pub struct BackendConfig {
     pub id: String,
     pub root: PathBuf,
+}
+
+/// S3-compatible archive backend. Works with AWS S3, Cloudflare R2,
+/// Backblaze B2, Wasabi, MinIO — anything that speaks the S3 protocol.
+/// Credentials are read from env vars (never the toml file itself) so
+/// the config can safely be committed.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ArchiveBackendConfig {
+    pub id: String,
+    pub endpoint: String,
+    pub bucket: String,
+    #[serde(default = "default_region")]
+    pub region: String,
+    /// Storage class hint passed on PUT. Backend-specific:
+    /// AWS S3: `STANDARD`/`STANDARD_IA`/`ONEZONE_IA`/`GLACIER`/`DEEP_ARCHIVE`.
+    /// R2/B2/Wasabi: leave default (single class).
+    #[serde(default = "default_storage_class")]
+    pub storage_class: String,
+    /// Env var name holding the access key id. Required.
+    pub access_key_env: String,
+    /// Env var name holding the secret access key. Required.
+    pub secret_key_env: String,
+    /// Local on-disk staging cache (typically on the Slow tier) used when
+    /// reading archive files. Defaults to `<db.parent>/.rhss_staging/<id>/`.
+    #[serde(default)]
+    pub staging_dir: Option<PathBuf>,
+    /// Path inside the bucket to use as the root (objects are stored at
+    /// `<prefix>/<logical_path>`). Default empty.
+    #[serde(default)]
+    pub prefix: String,
+}
+
+fn default_region() -> String {
+    "us-east-1".into()
+}
+
+fn default_storage_class() -> String {
+    "STANDARD".into()
 }
 
 impl RhssConfig {
@@ -66,8 +108,22 @@ impl RhssConfig {
         }
         let mut ids = std::collections::HashSet::new();
         for b in self.tier.fast.iter().chain(self.tier.slow.iter()) {
-            if !ids.insert(&b.id) {
+            if !ids.insert(b.id.clone()) {
                 return Err(FsError::Storage(format!("duplicate backend id: {}", b.id)));
+            }
+        }
+        for a in &self.tier.archive {
+            if !ids.insert(a.id.clone()) {
+                return Err(FsError::Storage(format!(
+                    "duplicate backend id: {}",
+                    a.id
+                )));
+            }
+            if a.endpoint.is_empty() || a.bucket.is_empty() {
+                return Err(FsError::Storage(format!(
+                    "archive backend {} missing endpoint/bucket",
+                    a.id
+                )));
             }
         }
         Ok(())
@@ -119,6 +175,63 @@ mod tests {
         )
         .unwrap();
         // tier.slow missing → toml::from_str will reject.
+        assert!(RhssConfig::load(&p).is_err());
+    }
+
+    #[test]
+    fn accepts_archive_tier() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("rhss.toml");
+        std::fs::write(
+            &p,
+            r#"
+            mount = "/mnt/rhss"
+            db = "/tmp/idx.db"
+            [[tier.fast]]
+            id = "ssd"
+            root = "/tmp/ssd"
+            [[tier.slow]]
+            id = "hdd"
+            root = "/tmp/hdd"
+            [[tier.archive]]
+            id = "r2"
+            endpoint = "https://example.r2.cloudflarestorage.com"
+            bucket = "rhss"
+            access_key_env = "R2_KEY"
+            secret_key_env = "R2_SECRET"
+            "#,
+        )
+        .unwrap();
+        let cfg = RhssConfig::load(&p).unwrap();
+        assert_eq!(cfg.tier.archive.len(), 1);
+        assert_eq!(cfg.tier.archive[0].region, "us-east-1"); // default
+        assert_eq!(cfg.tier.archive[0].storage_class, "STANDARD"); // default
+    }
+
+    #[test]
+    fn archive_id_conflicts_with_fast_or_slow_id() {
+        let dir = TempDir::new().unwrap();
+        let p = dir.path().join("rhss.toml");
+        std::fs::write(
+            &p,
+            r#"
+            mount = "/mnt/rhss"
+            db = "/tmp/idx.db"
+            [[tier.fast]]
+            id = "dup"
+            root = "/tmp/ssd"
+            [[tier.slow]]
+            id = "hdd"
+            root = "/tmp/hdd"
+            [[tier.archive]]
+            id = "dup"
+            endpoint = "https://e"
+            bucket = "b"
+            access_key_env = "K"
+            secret_key_env = "S"
+            "#,
+        )
+        .unwrap();
         assert!(RhssConfig::load(&p).is_err());
     }
 

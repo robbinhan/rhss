@@ -533,7 +533,14 @@ impl Filesystem for FuseAdapter {
         // files go directly to Slow so we don't hit ENOSPC on Fast.
         let fast_usage = self.state.router.fast.usage_ratio();
         let tier = self.state.policy.tier_for_create(fast_usage);
-        let backend = match self.state.router.tier(tier).pick() {
+        let tier_ref = match self.state.router.tier(tier) {
+            Some(t) => t,
+            None => {
+                reply.error(EIO);
+                return;
+            }
+        };
+        let backend = match tier_ref.pick() {
             Ok(b) => Arc::clone(b),
             Err(e) => {
                 reply.error(errno(&e));
@@ -912,8 +919,15 @@ impl Filesystem for FuseAdapter {
     fn statfs(&mut self, _req: &Request, _ino: u64, reply: ReplyStatfs) {
         let (fast_total, _fast_used, fast_free) = self.state.router.fast.capacity();
         let (slow_total, _slow_used, slow_free) = self.state.router.slow.capacity();
-        let total = fast_total + slow_total;
-        let free = fast_free + slow_free;
+        let (arc_total, arc_free) = match &self.state.router.archive {
+            Some(a) => {
+                let (t, _u, f) = a.capacity();
+                (t, f)
+            }
+            None => (0, 0),
+        };
+        let total = fast_total + slow_total + arc_total;
+        let free = fast_free + slow_free + arc_free;
         let bsize = 4096u32;
         let blocks = total / bsize as u64;
         let bfree = free / bsize as u64;
