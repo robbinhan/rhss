@@ -110,6 +110,17 @@ pub trait PathIndex: Send + Sync {
 
     /// Total number of indexed files (used by `statfs` and progress UI).
     fn count(&self) -> Result<u64>;
+
+    /// Top N files ranked by popularity score. `tier=None` ranks across
+    /// both tiers. `desc=true` for hottest-first, `desc=false` for
+    /// coldest-first. Used by `rhss hottest` / `rhss coldest` CLI.
+    fn top_n(&self, tier: Option<TierId>, desc: bool, limit: usize) -> Result<Vec<FileRow>>;
+
+    /// Per-tier (file_count, total_bytes). Used by `rhss stats`.
+    fn tier_summary(&self) -> Result<Vec<(TierId, u64, u64)>>;
+
+    /// Every row with `pinned_tier` set. Used by `rhss list-pinned`.
+    fn list_pinned(&self) -> Result<Vec<FileRow>>;
 }
 
 /// SQLite-backed PathIndex with an LRU cache for hot lookups.
@@ -390,6 +401,141 @@ impl PathIndex for SqlitePathIndex {
             .map_err(|e| FsError::Storage(format!("count: {e}")))?;
         Ok(n as u64)
     }
+
+    fn top_n(&self, tier: Option<TierId>, desc: bool, limit: usize) -> Result<Vec<FileRow>> {
+        let conn = self.inner.lock();
+        let order = if desc { "DESC" } else { "ASC" };
+        let (sql, tier_str) = if let Some(t) = tier {
+            (
+                format!(
+                    "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
+                            hit_count, popularity, pinned_tier, state
+                       FROM files WHERE tier = ?1
+                       ORDER BY popularity {order}, last_access {order}
+                       LIMIT ?2"
+                ),
+                Some(t.as_str()),
+            )
+        } else {
+            (
+                format!(
+                    "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
+                            hit_count, popularity, pinned_tier, state
+                       FROM files
+                       ORDER BY popularity {order}, last_access {order}
+                       LIMIT ?1"
+                ),
+                None,
+            )
+        };
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| FsError::Storage(format!("top_n prepare: {e}")))?;
+        let rows: Vec<_> = if let Some(t) = tier_str {
+            stmt.query_map(params![t, limit as i64], parse_row)
+                .map_err(|e| FsError::Storage(format!("top_n query: {e}")))?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FsError::Storage(format!("top_n collect: {e}")))?
+        } else {
+            stmt.query_map(params![limit as i64], parse_row)
+                .map_err(|e| FsError::Storage(format!("top_n query: {e}")))?
+                .collect::<std::result::Result<_, _>>()
+                .map_err(|e| FsError::Storage(format!("top_n collect: {e}")))?
+        };
+        rows.into_iter().map(row_to_file).collect()
+    }
+
+    fn tier_summary(&self) -> Result<Vec<(TierId, u64, u64)>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT tier, COUNT(*), COALESCE(SUM(size), 0)
+                   FROM files
+                   GROUP BY tier",
+            )
+            .map_err(|e| FsError::Storage(format!("tier_summary prepare: {e}")))?;
+        let rows = stmt
+            .query_map([], |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, i64>(1)? as u64,
+                    r.get::<_, i64>(2)? as u64,
+                ))
+            })
+            .map_err(|e| FsError::Storage(format!("tier_summary query: {e}")))?;
+        let mut out = Vec::new();
+        for r in rows {
+            let (t, n, b) = r.map_err(|e| FsError::Storage(format!("tier_summary row: {e}")))?;
+            out.push((TierId::parse(&t)?, n, b));
+        }
+        Ok(out)
+    }
+
+    fn list_pinned(&self) -> Result<Vec<FileRow>> {
+        let conn = self.inner.lock();
+        let mut stmt = conn
+            .prepare(
+                "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
+                        hit_count, popularity, pinned_tier, state
+                   FROM files
+                   WHERE pinned_tier IS NOT NULL
+                   ORDER BY logical_path",
+            )
+            .map_err(|e| FsError::Storage(format!("list_pinned prepare: {e}")))?;
+        let rows: Vec<_> = stmt
+            .query_map([], parse_row)
+            .map_err(|e| FsError::Storage(format!("list_pinned query: {e}")))?
+            .collect::<std::result::Result<_, _>>()
+            .map_err(|e| FsError::Storage(format!("list_pinned collect: {e}")))?;
+        rows.into_iter().map(row_to_file).collect()
+    }
+}
+
+type RawRow = (
+    String,         // logical_path
+    String,         // tier
+    String,         // backend_id
+    String,         // backend_path
+    i64,            // size
+    i64,            // last_access (unix secs)
+    i64,            // hit_count
+    f64,            // popularity
+    Option<String>, // pinned_tier
+    String,         // state
+);
+
+fn parse_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
+    Ok((
+        r.get(0)?,
+        r.get(1)?,
+        r.get(2)?,
+        r.get(3)?,
+        r.get(4)?,
+        r.get(5)?,
+        r.get(6)?,
+        r.get(7)?,
+        r.get(8)?,
+        r.get(9)?,
+    ))
+}
+
+fn row_to_file(raw: RawRow) -> Result<FileRow> {
+    let (lp, tier, bid, bpath, size, atime, hits, pop, pinned, state) = raw;
+    let pinned_tier = pinned.map(|s| TierId::parse(&s)).transpose()?;
+    Ok(FileRow {
+        logical_path: PathBuf::from(lp),
+        location: Location {
+            tier: TierId::parse(&tier)?,
+            backend_id: bid,
+            backend_path: PathBuf::from(bpath),
+            size: size as u64,
+        },
+        last_access: ts_from_secs(atime),
+        hit_count: hits as u64,
+        popularity: pop,
+        pinned_tier,
+        state: FileState::parse(&state)?,
+    })
 }
 
 #[cfg(test)]

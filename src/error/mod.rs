@@ -19,6 +19,9 @@ pub enum FsError {
     
     #[error("Invalid operation: {0}")]
     InvalidOperation(String),
+
+    #[error("Serialization error: {0}")]
+    Json(#[from] serde_json::Error),
 }
 
 pub type Result<T> = std::result::Result<T, FsError>; 
