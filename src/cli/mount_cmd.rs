@@ -12,9 +12,9 @@ use std::time::Duration;
 use tracing::{error, info, warn};
 
 use crate::access::AccessTracker;
-use crate::backend::Backend;
-use crate::control::{socket_path_for, server::OpContext, ControlServer};
-use crate::error::Result;
+use crate::backend::{Backend, S3Backend, S3Config};
+use crate::control::{server::OpContext, socket_path_for, ControlServer};
+use crate::error::{FsError, Result};
 use crate::fuse::FuseConfig;
 use crate::index::{PathIndex, SqlitePathIndex, TierId};
 use crate::lock::StorageLock;
@@ -92,7 +92,72 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
         .expect("fast tier");
     let slow = Tier::new(TierId::Slow, slow_backends, Box::new(MostFreePlacement))
         .expect("slow tier");
-    let router = Arc::new(TierRouter::new(fast, slow));
+    let mut router = TierRouter::new(fast, slow);
+
+    // Archive tier (optional). Each S3-style backend needs its creds via env
+    // vars (config holds the env-var NAMES, never the secrets).
+    if !cfg.tier.archive.is_empty() {
+        let mut archive_backends: Vec<Arc<dyn Backend>> = Vec::new();
+        for a in &cfg.tier.archive {
+            let staging = a.staging_dir.clone().unwrap_or_else(|| {
+                cfg.db
+                    .parent()
+                    .map(PathBuf::from)
+                    .unwrap_or_else(|| PathBuf::from("."))
+                    .join(".rhss_staging")
+                    .join(&a.id)
+            });
+            let ak = match std::env::var(&a.access_key_env) {
+                Ok(v) => v,
+                Err(_) => {
+                    error!(
+                        "archive backend {} missing env var {}",
+                        a.id, a.access_key_env
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let sk = match std::env::var(&a.secret_key_env) {
+                Ok(v) => v,
+                Err(_) => {
+                    error!(
+                        "archive backend {} missing env var {}",
+                        a.id, a.secret_key_env
+                    );
+                    std::process::exit(1);
+                }
+            };
+            let backend = match S3Backend::new(S3Config {
+                id: a.id.clone(),
+                endpoint: a.endpoint.clone(),
+                bucket: a.bucket.clone(),
+                region: a.region.clone(),
+                storage_class: a.storage_class.clone(),
+                access_key: ak,
+                secret_key: sk,
+                staging_root: staging,
+                prefix: a.prefix.clone(),
+            }) {
+                Ok(b) => b as Arc<dyn Backend>,
+                Err(e) => {
+                    error!("init archive backend {}: {e}", a.id);
+                    std::process::exit(1);
+                }
+            };
+            archive_backends.push(backend);
+        }
+        let archive_tier =
+            Tier::new(TierId::Archive, archive_backends, Box::new(MostFreePlacement))
+                .map_err(|e| FsError::Storage(format!("archive tier: {e}")))
+                .unwrap_or_else(|e| {
+                    error!("{e}");
+                    std::process::exit(1);
+                });
+        router = router.with_archive(archive_tier);
+        info!("archive tier configured with {} backend(s)", cfg.tier.archive.len());
+    }
+
+    let router = Arc::new(router);
 
     let index: Arc<dyn PathIndex> = match SqlitePathIndex::open(&cfg.db) {
         Ok(i) => i,

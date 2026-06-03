@@ -33,7 +33,7 @@
 
 | 编号 | 候选项 | 来源 / 借鉴 | 评估时点 | 大致方案 |
 |---|---|---|---|---|
-| 候选-A | **S3 / 对象存储 backend 作为第三层 archive** | HydraDB 三层(memory / SSD / object)启发 | v0.3 评估 | 已有 `Backend` trait,实现 `S3Backend`(`s3` / `object_store` crate);配置加 `[[tier.archive]] endpoint=... storage_class=...`;迁移策略加 `min_age_to_archive`(默认 365 天);FUSE `open` 处理"解冻"等待 + 状态显示。预计 ~2 周 |
+| ~~候选-A~~ ✅ 已落地 | ~~S3 / 对象存储 backend 作为第三层 archive~~ | HydraDB 三层(memory / SSD / object)启发 | **已合并** | 实现:`src/backend/s3.rs`(rust-s3 sync,~440 行);config `[[tier.archive]]`;tierer 链式 Fast→Slow→Archive;Read 走 staging cache。决策详见 D22;**Mirror multi-replica + thaw + Glacier 取回 留 D23 → v2** |
 | 候选-B | **文件 mutability 列 + 利用其做分层决策** | HydraDB Memories vs Knowledge 二分启发 | v0.4 评估 | `PathIndex` 加列 `mutability TEXT CHECK ('mutable','immutable','unknown')`;来源:`chflags uchg` / `chattr +i` 显式标记 + 连续 N 天 mtime 不变自动转 immutable;immutable 文件可激进下沉、可在 Slow 层做 zstd 压缩/去重。预计 ~1 周 |
 | 候选-C | **per-backend `cost_per_gb_month` + 成本感知 placement** | HydraDB 按存储分层定价启发 | v0.5 评估 | `BackendStats` 加 `cost_per_gb_month: Option<f64>`;配置每个 backend 可选声明成本;新增 `CostAwarePlacement`(对成本敏感时优先便宜的 backend,反之 fallback 到 `MostFreePlacement`)。预计 ~3 天,trait 已支持 |
 

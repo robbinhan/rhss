@@ -155,6 +155,7 @@ fn tier_name(t: TierId) -> &'static str {
     match t {
         TierId::Fast => "Fast",
         TierId::Slow => "Slow",
+        TierId::Archive => "Archive",
     }
 }
 

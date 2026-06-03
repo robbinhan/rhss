@@ -12,8 +12,10 @@ use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
 pub mod posix;
+pub mod s3;
 
 pub use posix::PosixBackend;
+pub use s3::{S3Backend, S3Config};
 
 use crate::error::Result;
 

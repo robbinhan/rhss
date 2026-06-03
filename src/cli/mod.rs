@@ -177,6 +177,7 @@ pub enum ConfigCmd {
 pub enum TierArg {
     Fast,
     Slow,
+    Archive,
 }
 
 impl From<TierArg> for crate::index::TierId {
@@ -184,6 +185,7 @@ impl From<TierArg> for crate::index::TierId {
         match t {
             TierArg::Fast => crate::index::TierId::Fast,
             TierArg::Slow => crate::index::TierId::Slow,
+            TierArg::Archive => crate::index::TierId::Archive,
         }
     }
 }

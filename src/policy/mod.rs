@@ -52,7 +52,21 @@ pub trait TieringPolicy: Send + Sync {
     fn min_age_to_evict(&self) -> Duration;
     fn initial_popularity(&self) -> f64;
 
+    /// How old (no access) a Slow-tier file must be before the tierer
+    /// considers archiving it. Default 365 days. Archive is opt-in
+    /// (require a configured archive tier).
+    fn min_age_to_archive(&self) -> Duration {
+        Duration::from_secs(365 * 86_400)
+    }
+
+    /// Slow-tier usage above this triggers Slow → Archive demotion in
+    /// addition to the age check. Conservative default: 80%.
+    fn slow_archive_watermark(&self) -> f64 {
+        0.80
+    }
+
     /// New file create: which tier to land on, given current fast-tier usage.
+    /// Archive is never a create target — files always start on Fast/Slow.
     fn tier_for_create(&self, fast_usage: f64) -> TierId {
         if fast_usage >= self.panic_watermark() {
             TierId::Slow
@@ -62,7 +76,7 @@ pub trait TieringPolicy: Send + Sync {
     }
 }
 
-/// Default policy: EMA + 3 watermarks (D6, D17).
+/// Default policy: EMA + 3 watermarks (D6, D17) + archive demotion.
 #[derive(Debug, Clone, Copy)]
 pub struct PopularityPolicy {
     pub low_watermark: f64,
@@ -71,6 +85,11 @@ pub struct PopularityPolicy {
     /// `None` means manual-only mode (D15: tier_period < 0).
     pub tier_period: Option<Duration>,
     pub min_age_to_evict: Duration,
+    /// How long a file must sit on Slow without access before it's a
+    /// candidate for archiving. Default 365 days.
+    pub min_age_to_archive: Duration,
+    /// Slow-tier usage above which the tierer also runs Slow → Archive.
+    pub slow_archive_watermark: f64,
 }
 
 impl Default for PopularityPolicy {
@@ -81,6 +100,8 @@ impl Default for PopularityPolicy {
             panic_watermark: 0.95,
             tier_period: Some(Duration::from_secs(600)),
             min_age_to_evict: Duration::from_secs(300),
+            min_age_to_archive: Duration::from_secs(365 * 86_400),
+            slow_archive_watermark: 0.80,
         }
     }
 }
@@ -103,6 +124,12 @@ impl TieringPolicy for PopularityPolicy {
     }
     fn initial_popularity(&self) -> f64 {
         INITIAL_POPULARITY
+    }
+    fn min_age_to_archive(&self) -> Duration {
+        self.min_age_to_archive
+    }
+    fn slow_archive_watermark(&self) -> f64 {
+        self.slow_archive_watermark
     }
 }
 
