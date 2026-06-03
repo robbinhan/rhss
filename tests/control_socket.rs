@@ -136,6 +136,9 @@ fn pin_then_unpin_roundtrips() {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: rhss::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         })
         .unwrap();
 
@@ -204,6 +207,9 @@ fn migrate_moves_an_indexed_file() {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: rhss::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         })
         .unwrap();
 

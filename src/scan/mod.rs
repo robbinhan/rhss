@@ -125,6 +125,9 @@ fn scan_one(
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         };
         index.insert(row)?;
         claimed.insert(logical, (tier, backend.id().to_string()));

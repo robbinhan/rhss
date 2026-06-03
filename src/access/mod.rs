@@ -120,6 +120,9 @@ mod tests {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         })
         .unwrap();
 

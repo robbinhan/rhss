@@ -11,7 +11,7 @@ use tracing::{debug, error, info, warn};
 
 use crate::backend::Backend;
 use crate::error::{FsError, Result};
-use crate::index::{PathIndex, TierId};
+use crate::index::{Mutability, PathIndex, TierId};
 use crate::scan;
 use crate::tier::TierRouter;
 use crate::tierer::{migrate, OpenFileTracker, TiererHandle};
@@ -149,6 +149,8 @@ fn dispatch(req: Request, ctx: &OpContext) -> Response {
         Request::Ping => op_ping(ctx),
         Request::Pin { path, tier } => op_pin(ctx, path, Some(tier.into())),
         Request::Unpin { path } => op_pin(ctx, path, None),
+        Request::Lock { path } => op_set_mutability(ctx, path, Mutability::Immutable),
+        Request::Unlock { path } => op_set_mutability(ctx, path, Mutability::Mutable),
         Request::Oneshot { wait } => op_oneshot(ctx, wait),
         Request::Migrate { path, to } => op_migrate(ctx, path, to.into()),
         Request::Freeze => op_freeze(ctx, true),
@@ -182,6 +184,20 @@ fn op_pin(ctx: &OpContext, path: PathBuf, tier: Option<TierId>) -> Response {
         path: logical,
         tier: tier.map(Into::into),
     })
+}
+
+fn op_set_mutability(ctx: &OpContext, path: PathBuf, m: Mutability) -> Response {
+    let logical = normalize(&path);
+    if ctx.index.locate(&logical).ok().flatten().is_none() {
+        return Response::err(format!("not indexed: {}", logical.display()));
+    }
+    match ctx.index.set_mutability(&logical, m) {
+        Ok(()) => Response::ok_data(ResponseData::Mutability {
+            path: logical,
+            immutable: m == Mutability::Immutable,
+        }),
+        Err(e) => Response::err(format!("set_mutability: {e}")),
+    }
 }
 
 fn op_oneshot(ctx: &OpContext, wait: bool) -> Response {

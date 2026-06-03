@@ -599,12 +599,15 @@ impl Filesystem for FuseAdapter {
                 backend_path: rel.clone(),
                 size: meta.size,
             },
-            replicas: Vec::new(), // new files start single-replica; mirror is applied at first migrate
+            replicas: Vec::new(),
             last_access: SystemTime::now(),
             hit_count: 0,
             popularity: self.state.policy.initial_popularity(), // D17
             pinned_tier: None,
             state: FileState::Stable,
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         };
         if let Err(e) = self.state.index.insert(row) {
             reply.error(errno(&e));

@@ -43,6 +43,24 @@ pub fn unpin(ctx: &CliContext, args: WhichArgs) -> Result<()> {
     render(ctx, resp, "unpinned")
 }
 
+pub fn lock(ctx: &CliContext, args: WhichArgs, want_immutable: bool) -> Result<()> {
+    let req = if want_immutable {
+        Request::Lock { path: args.path }
+    } else {
+        Request::Unlock { path: args.path }
+    };
+    let resp = send(ctx, &req)?;
+    render(
+        ctx,
+        resp,
+        if want_immutable {
+            "locked (immutable)"
+        } else {
+            "unlocked (mutable)"
+        },
+    )
+}
+
 pub fn oneshot(ctx: &CliContext, args: OneshotArgs) -> Result<()> {
     let resp = send(ctx, &Request::Oneshot { wait: args.wait })?;
     render(ctx, resp, "oneshot triggered")
@@ -170,6 +188,11 @@ fn render_data(d: ResponseData) {
             Some(t) => println!("pinned {} → {:?}", path.display(), t),
             None => println!("unpinned {}", path.display()),
         },
+        Mutability { path, immutable } => println!(
+            "{} {}",
+            if immutable { "locked" } else { "unlocked" },
+            path.display()
+        ),
         OneshotCompleted { waited } => {
             if waited {
                 println!("oneshot complete");

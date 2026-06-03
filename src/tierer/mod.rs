@@ -407,11 +407,9 @@ fn evict_cold(
 
     // Chain 2: Slow → Archive, only when an archive tier is configured.
     if router.has_archive() {
-        // Use the archive-specific watermark + min-age. Same shape as chain 1
-        // but with the slow tier's capacity as the source.
+        // Standard age-gated chain for all files.
         let slow_usage = router.slow.usage_ratio();
         if slow_usage > policy.slow_archive_watermark() {
-            // Bring slow back down to (slow_archive_watermark - 0.10).
             let target_usage = (policy.slow_archive_watermark() - 0.10).max(0.0);
             evict_chain(
                 router,
@@ -419,12 +417,50 @@ fn evict_cold(
                 open_tracker,
                 TierId::Slow,
                 TierId::Archive,
-                target_usage, // unused — we recompute to_free below
+                target_usage,
                 policy.slow_archive_watermark(),
                 policy.min_age_to_archive(),
                 || router.slow.capacity(),
                 || router.slow.usage_ratio(),
             );
+        }
+        // D24: aggressive demotion for immutable Slow-tier files. Skip the
+        // age check entirely — if a file is declared immutable and is the
+        // coldest by popularity, send it to Archive regardless of how
+        // recently it was accessed. The watermark still gates so we don't
+        // demote when Slow is nearly empty.
+        if router.slow.usage_ratio() > policy.low_watermark() {
+            evict_immutable_to_archive(router, index, open_tracker);
+        }
+    }
+}
+
+fn evict_immutable_to_archive(
+    router: &TierRouter,
+    index: &Arc<dyn PathIndex>,
+    open_tracker: &Arc<OpenFileTracker>,
+) {
+    // Cheap: pull a handful of coldest Slow rows with min_age=0, filter
+    // for immutable, demote. Cap at 100 to avoid hot-loops on giant indexes.
+    let coldest = match index.coldest(TierId::Slow, u64::MAX, std::time::Duration::ZERO) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("evict_immutable: coldest query: {:?}", e);
+            return;
+        }
+    };
+    for (path, _size) in coldest.into_iter().take(100) {
+        let row = match index.get(&path).ok().flatten() {
+            Some(r) => r,
+            None => continue,
+        };
+        if row.mutability != crate::index::Mutability::Immutable {
+            continue;
+        }
+        match migrate(router, index, open_tracker, &path, TierId::Archive) {
+            Ok(true) => debug!("immutable demote {} → Archive", path.display()),
+            Ok(false) => {}
+            Err(e) => warn!("immutable migrate {}: {:?}", path.display(), e),
         }
     }
 }
@@ -539,6 +575,9 @@ mod tests {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         }
     }
 

@@ -77,6 +77,13 @@ pub enum Cmd {
     /// Clear a file's tier pin.
     Unpin(WhichArgs),
 
+    /// Mark a file immutable (write-once). Tierer can demote aggressively;
+    /// Slow tier may compress; can be deduped with other identical files.
+    Lock(WhichArgs),
+
+    /// Mark a file mutable again. Reverses `lock`.
+    Unlock(WhichArgs),
+
     /// Trigger one tier-eviction cycle immediately.
     Oneshot(OneshotArgs),
 
@@ -213,6 +220,8 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Replicas(args) => inspect::replicas(&ctx, args),
         Cmd::Pin(args) => control::pin(&ctx, args),
         Cmd::Unpin(args) => control::unpin(&ctx, args),
+        Cmd::Lock(args) => control::lock(&ctx, args, true),
+        Cmd::Unlock(args) => control::lock(&ctx, args, false),
         Cmd::Oneshot(args) => control::oneshot(&ctx, args),
         Cmd::Migrate(args) => control::migrate(&ctx, args),
         Cmd::Freeze => control::freeze(&ctx, true),
