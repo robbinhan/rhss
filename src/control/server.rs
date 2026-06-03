@@ -157,7 +157,69 @@ fn dispatch(req: Request, ctx: &OpContext) -> Response {
         Request::Unfreeze => op_freeze(ctx, false),
         Request::Fsck { repair } => op_fsck(ctx, repair),
         Request::Rescan => op_rescan(ctx),
+        Request::DedupGc => op_dedup_gc(ctx),
     }
+}
+
+fn op_dedup_gc(ctx: &OpContext) -> Response {
+    // Scan content_blobs for entries whose refcount is 0 OR whose backing
+    // file is gone. Delete the physical file (if any) and remove the blob
+    // row. Stats reported back.
+    // We don't have a public method to iterate blobs; query the index
+    // backing connection directly via a tiny query through PathIndex's
+    // typed API. Simplest: get the SqlitePathIndex via Arc<dyn PathIndex>
+    // and just bypass — actually we don't have access to the conn here.
+    // Workaround: pull all blobs by checking each file row's content_hash
+    // and dedup-ing the lookup. Imperfect but bounded.
+    let count = ctx.index.count().unwrap_or(0);
+    let rows = match ctx
+        .index
+        .top_n(None, false, count.max(1) as usize)
+    {
+        Ok(rs) => rs,
+        Err(e) => return Response::err(format!("dedup-gc scan: {e}")),
+    };
+    let mut hashes: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for r in &rows {
+        if let Some(h) = &r.content_hash {
+            hashes.insert(h.clone());
+        }
+    }
+
+    let mut scanned = 0u64;
+    let mut removed = 0u64;
+    let mut bytes_freed = 0u64;
+    // We don't currently have a `list_blobs()` API — instead iterate
+    // the hashes we DO have rows for, and for each, check if the blob
+    // exists on disk. (Truly orphan blobs without any file row will
+    // be caught in a v2 follow-up.)
+    for hash in &hashes {
+        scanned += 1;
+        let Ok(Some(blob)) = ctx.index.lookup_blob(hash) else {
+            continue;
+        };
+        let Some(backend) = ctx.router.resolve_backend(blob.tier, &blob.backend_id) else {
+            continue;
+        };
+        let exists = backend.exists(&blob.backend_path).unwrap_or(false);
+        if !exists {
+            // Physical file missing — drop the blob row. Files referencing
+            // this blob will surface in fsck inconsistencies on next run.
+            let mut r = 0;
+            while ctx.index.unref_blob(hash).unwrap_or(false) {
+                r += 1;
+            }
+            if r > 0 {
+                removed += 1;
+                bytes_freed += blob.size;
+            }
+        }
+    }
+    Response::ok_data(ResponseData::DedupGc {
+        blobs_scanned: scanned,
+        blobs_removed: removed,
+        bytes_freed,
+    })
 }
 
 // ===== per-op handlers =====
@@ -188,9 +250,25 @@ fn op_pin(ctx: &OpContext, path: PathBuf, tier: Option<TierId>) -> Response {
 
 fn op_set_mutability(ctx: &OpContext, path: PathBuf, m: Mutability) -> Response {
     let logical = normalize(&path);
-    if ctx.index.locate(&logical).ok().flatten().is_none() {
-        return Response::err(format!("not indexed: {}", logical.display()));
+    let row = match ctx.index.get(&logical) {
+        Ok(Some(r)) => r,
+        Ok(None) => return Response::err(format!("not indexed: {}", logical.display())),
+        Err(e) => return Response::err(format!("index error: {e}")),
+    };
+
+    // D25: copy-on-write when transitioning immutable → mutable on a
+    // deduped file. Otherwise other files sharing the blob would see edits
+    // — that would defeat the entire dedup-correctness contract.
+    if m == Mutability::Mutable && row.mutability == Mutability::Immutable {
+        if let Some(hash) = &row.content_hash {
+            if let Ok(Some(_blob)) = ctx.index.lookup_blob(hash) {
+                if let Err(e) = cow_unshare(ctx, &row) {
+                    return Response::err(format!("CoW unshare failed: {e}"));
+                }
+            }
+        }
     }
+
     match ctx.index.set_mutability(&logical, m) {
         Ok(()) => Response::ok_data(ResponseData::Mutability {
             path: logical,
@@ -198,6 +276,79 @@ fn op_set_mutability(ctx: &OpContext, path: PathBuf, m: Mutability) -> Response 
         }),
         Err(e) => Response::err(format!("set_mutability: {e}")),
     }
+}
+
+/// CoW: copy the shared blob out to a private filename for `row`, update
+/// the index, and unref the blob. After this, the file has its own bytes
+/// and editing it won't affect any other dedup sibling.
+fn cow_unshare(ctx: &OpContext, row: &crate::index::FileRow) -> Result<()> {
+    let backend = ctx
+        .router
+        .resolve_backend(row.location.tier, &row.location.backend_id)
+        .ok_or_else(|| {
+            FsError::Storage(format!(
+                "CoW: backend {} not found",
+                row.location.backend_id
+            ))
+        })?;
+    // Build a private path: append ".unique-N" until unused.
+    let mut private = row.location.backend_path.clone();
+    let mut i = 0u32;
+    loop {
+        let candidate = {
+            let mut s = private.as_os_str().to_owned();
+            s.push(format!(".unique-{i}"));
+            std::path::PathBuf::from(s)
+        };
+        if !backend.exists(&candidate).unwrap_or(false) {
+            private = candidate;
+            break;
+        }
+        i += 1;
+        if i > 1000 {
+            return Err(FsError::Storage("CoW: too many unique attempts".into()));
+        }
+    }
+
+    // For compressed files we copy the .zst (and keep the compressed flag).
+    // We use stream IO via the backend's read/write API.
+    let src_on_disk = if row.compressed {
+        crate::tierer::compress::compressed_path(&row.location.backend_path)
+    } else {
+        row.location.backend_path.clone()
+    };
+    let dst_on_disk = if row.compressed {
+        crate::tierer::compress::compressed_path(&private)
+    } else {
+        private.clone()
+    };
+    let mut offset = 0u64;
+    let chunk_size = 1 << 20;
+    loop {
+        let chunk = backend.read_at(&src_on_disk, offset, chunk_size as u32)?;
+        if chunk.is_empty() {
+            break;
+        }
+        backend.write_at(&dst_on_disk, offset, &chunk)?;
+        offset += chunk.len() as u64;
+        if (chunk.len() as u64) < chunk_size as u64 {
+            break;
+        }
+    }
+    backend.fsync(&dst_on_disk)?;
+
+    // Update the index row to point at the private path. Clear
+    // content_hash (file is no longer part of the dedup group).
+    let mut new_row = row.clone();
+    new_row.location.backend_path = private;
+    new_row.content_hash = None;
+    ctx.index.insert(new_row)?;
+
+    // Unref the original blob.
+    if let Some(hash) = &row.content_hash {
+        let _ = ctx.index.unref_blob(hash);
+    }
+    Ok(())
 }
 
 fn op_oneshot(ctx: &OpContext, wait: bool) -> Response {

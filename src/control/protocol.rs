@@ -55,6 +55,7 @@ pub enum Request {
     Unfreeze,
     Fsck { repair: bool },
     Rescan,
+    DedupGc,
 }
 
 /// Responses share an envelope: `ok` + optional `data` + optional `error`.
@@ -139,6 +140,12 @@ pub enum ResponseData {
         added: u64,
         already_indexed: u64,
         conflicts: Vec<PathBuf>,
+    },
+    /// `dedup-gc` response.
+    DedupGc {
+        blobs_scanned: u64,
+        blobs_removed: u64,
+        bytes_freed: u64,
     },
 }
 

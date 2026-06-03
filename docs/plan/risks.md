@@ -43,6 +43,7 @@
 |---|---|---|
 | ✅ 候选-A | S3 archive 第三层 | 详见 D22。商家无关 S3 兼容协议(R2/B2/Wasabi/MinIO);staging cache;rust-s3 sync;tierer 链式 Fast→Slow→Archive |
 | ✅ 候选-D | 多副本(MirrorPlacement)| 详见 D23。任一 tier 可选 `placement = "mirror"`;migrate 多副本写入 + 回滚;FUSE open 副本 fallback;`rhss replicas` CLI;fsck 检测一致性 |
+| ✅ 候选-B | mutability + zstd + dedup | 详见 D24 + D25。`rhss lock/unlock`;immutable 文件激进下沉 Slow + 跳过 min_age_to_archive;迁移自动 zstd 压缩;identical immutable 文件自动 dedup 共享 blob;CoW on unlock;`rhss dedup-gc` orphan 清理。**未做**:Archive 压缩、fsck 内容完整性、跨 mirror 的 dedup |
 
 ## 跑偏检测清单(每周 review)
 

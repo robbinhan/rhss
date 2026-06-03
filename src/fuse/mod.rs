@@ -693,13 +693,42 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
+        // D25: dedup-aware unlink. If the file is part of a deduped blob,
+        // unref it; only delete the physical file when refcount → 0.
+        let row = self.state.index.get(&logical).ok().flatten();
         let Some((backend, bpath)) = self.state.resolve(&logical) else {
             reply.error(ENOENT);
             return;
         };
-        if let Err(e) = backend.remove(&bpath) {
-            reply.error(errno(&e));
-            return;
+        let mut should_remove_physical = true;
+        if let Some(r) = &row {
+            if let Some(hash) = &r.content_hash {
+                match self.state.index.unref_blob(hash) {
+                    Ok(true) => {
+                        // Refcount hit 0 — last reference. Delete physical.
+                        should_remove_physical = true;
+                    }
+                    Ok(false) => {
+                        // Other files still reference this blob — leave it.
+                        should_remove_physical = false;
+                    }
+                    Err(e) => {
+                        warn!("unref_blob {}: {:?}", logical.display(), e);
+                    }
+                }
+            }
+        }
+        if should_remove_physical {
+            // For compressed files the on-disk file has a .zst suffix.
+            let on_disk = if row.as_ref().map(|r| r.compressed).unwrap_or(false) {
+                crate::tierer::compress::compressed_path(&bpath)
+            } else {
+                bpath.clone()
+            };
+            if let Err(e) = backend.remove(&on_disk) {
+                reply.error(errno(&e));
+                return;
+            }
         }
         if let Err(e) = self.state.index.remove(&logical) {
             warn!("index.remove {}: {:?}", logical.display(), e);

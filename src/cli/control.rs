@@ -99,6 +99,11 @@ pub fn rescan(ctx: &CliContext) -> Result<()> {
     render(ctx, resp, "rescan complete")
 }
 
+pub fn dedup_gc(ctx: &CliContext) -> Result<()> {
+    let resp = send(ctx, &Request::DedupGc)?;
+    render(ctx, resp, "dedup-gc complete")
+}
+
 // ===== TierArg → wire Tier =====
 
 impl From<super::TierArg> for crate::control::Tier {
@@ -265,6 +270,19 @@ fn render_data(d: ResponseData) {
             for c in conflicts.iter().take(20) {
                 println!("  conflict: {}", c.display());
             }
+        }
+        DedupGc {
+            blobs_scanned,
+            blobs_removed,
+            bytes_freed,
+        } => {
+            use crate::cli::common::fmt_bytes;
+            println!(
+                "dedup-gc: scanned {} blobs, removed {} orphans, freed {}",
+                blobs_scanned,
+                blobs_removed,
+                fmt_bytes(bytes_freed)
+            );
         }
     }
 }

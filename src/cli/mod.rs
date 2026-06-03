@@ -102,6 +102,9 @@ pub enum Cmd {
     /// Re-scan backends to ingest newly-dropped files.
     Rescan,
 
+    /// Sweep orphan dedup blobs.
+    DedupGc,
+
     /// Health-check the control socket.
     Ping,
 
@@ -228,6 +231,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Unfreeze => control::freeze(&ctx, false),
         Cmd::Fsck(args) => control::fsck(&ctx, args),
         Cmd::Rescan => control::rescan(&ctx),
+        Cmd::DedupGc => control::dedup_gc(&ctx),
         Cmd::Ping => control::ping(&ctx),
         Cmd::Config(c) => config_cmd::run(&ctx, c),
     }

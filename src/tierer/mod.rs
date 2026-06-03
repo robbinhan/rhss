@@ -92,6 +92,53 @@ pub fn migrate(
         && target_tier == TierId::Slow;
     let mut new_hash: Option<String> = row.content_hash.clone();
 
+    // D25: dedup. For immutable files, hash-then-lookup before writing.
+    // If a blob with this content already exists, we point the new index
+    // row at it and bump refcount — zero on-disk bytes added. This only
+    // kicks in when the destination is NOT a mirror tier (mirror semantics
+    // would conflict with shared blobs).
+    if row.mutability == crate::index::Mutability::Immutable && !is_mirror {
+        // We need the hash. Either it's already cached, or we compute it
+        // from the source now.
+        let hash = match &row.content_hash {
+            Some(h) => h.clone(),
+            None => match hash_file(src_backend, &row.location.backend_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("dedup hash {}: {:?}", logical.display(), e);
+                    String::new()
+                }
+            },
+        };
+        if !hash.is_empty() {
+            if let Ok(Some(existing)) = index.lookup_blob(&hash) {
+                if existing.tier == target_tier {
+                    // Found a blob on this tier — bump refcount and just
+                    // update the file row. NO physical write.
+                    let _ = index.register_blob(existing.clone());
+                    let new_loc = Location {
+                        tier: target_tier,
+                        backend_id: existing.backend_id.clone(),
+                        backend_path: existing.backend_path.clone(),
+                        size: row.location.size,
+                    };
+                    let mut full_row = row.clone();
+                    full_row.location = new_loc;
+                    full_row.replicas = Vec::new();
+                    full_row.state = crate::index::FileState::Stable;
+                    full_row.compressed = existing.compressed;
+                    full_row.content_hash = Some(hash);
+                    index.insert(full_row)?;
+                    // Source unlink (we no longer need it).
+                    let _ = src_backend.remove(&row.location.backend_path);
+                    debug!("dedup hit: {} reuses blob", logical.display());
+                    return Ok(true);
+                }
+            }
+            new_hash = Some(hash);
+        }
+    }
+
     // 1. Copy src -> all dst backends (compressed or raw). Roll back any
     //    failure.
     let mut written: Vec<&Arc<dyn Backend>> = Vec::with_capacity(dst_backends.len());
@@ -167,10 +214,29 @@ pub fn migrate(
     full_row.replicas = replicas;
     full_row.state = crate::index::FileState::Stable;
     full_row.compressed = should_compress;
+    let final_hash = new_hash.clone();
     if let Some(h) = new_hash {
         full_row.content_hash = Some(h);
     }
     index.insert(full_row)?;
+
+    // D25: register the freshly-written blob in content_blobs so future
+    // duplicates dedup against it. Only for immutable single-replica
+    // writes (the same condition we use to look up). Stores the LOGICAL
+    // backend_path; the .zst suffix is added by the read path based on
+    // the compressed flag.
+    if row.mutability == crate::index::Mutability::Immutable && !is_mirror {
+        if let Some(h) = final_hash {
+            let _ = index.register_blob(crate::index::BlobRef {
+                hash: h,
+                tier: target_tier,
+                backend_id: primary.id().to_string(),
+                backend_path: dst_path.clone(),
+                size: row.location.size,
+                compressed: should_compress,
+            });
+        }
+    }
 
     // 4. Best-effort source unlink. Orphans cleaned by startup scrub /
     //    fsck. For mirror migration the "source" can itself be one of the
