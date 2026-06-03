@@ -23,7 +23,17 @@ use crate::index::{Location, PathIndex, ReplicaLoc, TierId};
 use crate::policy::TieringPolicy;
 use crate::tier::TierRouter;
 
+fn compressed_or_raw(path: &Path, compressed: bool) -> std::path::PathBuf {
+    if compressed {
+        compress::compressed_path(path)
+    } else {
+        path.to_path_buf()
+    }
+}
+
+pub mod compress;
 pub mod open_tracker;
+pub use compress::{compress_between, ensure_decompressed, hash_file};
 pub use open_tracker::OpenFileTracker;
 
 const COPY_BUF_SIZE: usize = 1 << 20; // 1 MiB chunks
@@ -75,40 +85,106 @@ pub fn migrate(
 
     let dst_path = row.location.backend_path.clone();
 
-    // 1. Stream-copy src -> all dst backends. On any failure, roll back
-    //    every dst write we already did (best-effort delete), then bail.
+    // D24: compress immutable files when demoting to Slow. (Archive
+    // compression is left for v2 — S3 already does TLS+content-type
+    // negotiation and the latency cost of compress-on-PUT is unclear.)
+    let should_compress = row.mutability == crate::index::Mutability::Immutable
+        && target_tier == TierId::Slow;
+    let mut new_hash: Option<String> = row.content_hash.clone();
+
+    // D25: dedup. For immutable files, hash-then-lookup before writing.
+    // If a blob with this content already exists, we point the new index
+    // row at it and bump refcount — zero on-disk bytes added. This only
+    // kicks in when the destination is NOT a mirror tier (mirror semantics
+    // would conflict with shared blobs).
+    if row.mutability == crate::index::Mutability::Immutable && !is_mirror {
+        // We need the hash. Either it's already cached, or we compute it
+        // from the source now.
+        let hash = match &row.content_hash {
+            Some(h) => h.clone(),
+            None => match hash_file(src_backend, &row.location.backend_path) {
+                Ok(h) => h,
+                Err(e) => {
+                    warn!("dedup hash {}: {:?}", logical.display(), e);
+                    String::new()
+                }
+            },
+        };
+        if !hash.is_empty() {
+            if let Ok(Some(existing)) = index.lookup_blob(&hash) {
+                if existing.tier == target_tier {
+                    // Found a blob on this tier — bump refcount and just
+                    // update the file row. NO physical write.
+                    let _ = index.register_blob(existing.clone());
+                    let new_loc = Location {
+                        tier: target_tier,
+                        backend_id: existing.backend_id.clone(),
+                        backend_path: existing.backend_path.clone(),
+                        size: row.location.size,
+                    };
+                    let mut full_row = row.clone();
+                    full_row.location = new_loc;
+                    full_row.replicas = Vec::new();
+                    full_row.state = crate::index::FileState::Stable;
+                    full_row.compressed = existing.compressed;
+                    full_row.content_hash = Some(hash);
+                    index.insert(full_row)?;
+                    // Source unlink (we no longer need it).
+                    let _ = src_backend.remove(&row.location.backend_path);
+                    debug!("dedup hit: {} reuses blob", logical.display());
+                    return Ok(true);
+                }
+            }
+            new_hash = Some(hash);
+        }
+    }
+
+    // 1. Copy src -> all dst backends (compressed or raw). Roll back any
+    //    failure.
     let mut written: Vec<&Arc<dyn Backend>> = Vec::with_capacity(dst_backends.len());
     for dst in &dst_backends {
-        if let Err(e) = copy_streaming(src_backend, &row.location.backend_path, dst, &dst_path) {
+        let copy_result = if should_compress {
+            compress_between(src_backend, &row.location.backend_path, dst, &dst_path)
+                .map(|h| {
+                    new_hash = Some(h);
+                })
+        } else {
+            copy_streaming(src_backend, &row.location.backend_path, dst, &dst_path)
+        };
+        if let Err(e) = copy_result {
             warn!(
                 "migrate {} replica {} failed; rolling back",
                 logical.display(),
                 dst.id()
             );
             for already in &written {
-                let _ = already.remove(&dst_path);
+                let _ = already.remove(&compressed_or_raw(&dst_path, should_compress));
             }
             return Err(e);
         }
-        if let Err(e) = dst.fsync(&dst_path) {
+        let actual_path = compressed_or_raw(&dst_path, should_compress);
+        if let Err(e) = dst.fsync(&actual_path) {
             warn!(
                 "migrate {} replica {} fsync failed; rolling back",
                 logical.display(),
                 dst.id()
             );
-            let _ = dst.remove(&dst_path);
+            let _ = dst.remove(&actual_path);
             for already in &written {
-                let _ = already.remove(&dst_path);
+                let _ = already.remove(&compressed_or_raw(&dst_path, should_compress));
             }
             return Err(e);
         }
         written.push(dst);
     }
 
-    // 2. Preserve atime/mtime on every replica (D16).
+    // 2. Preserve atime/mtime on every replica (D16). Use the actual
+    //    on-disk path (`.zst` suffix if compressed) since set_times needs
+    //    to find the file.
     if let Ok(orig_meta) = src_backend.metadata(&row.location.backend_path) {
+        let actual = compressed_or_raw(&dst_path, should_compress);
         for dst in &written {
-            let _ = dst.set_times(&dst_path, Some(orig_meta.atime), Some(orig_meta.mtime));
+            let _ = dst.set_times(&actual, Some(orig_meta.atime), Some(orig_meta.mtime));
         }
     }
 
@@ -137,7 +213,30 @@ pub fn migrate(
     full_row.location = new_loc;
     full_row.replicas = replicas;
     full_row.state = crate::index::FileState::Stable;
+    full_row.compressed = should_compress;
+    let final_hash = new_hash.clone();
+    if let Some(h) = new_hash {
+        full_row.content_hash = Some(h);
+    }
     index.insert(full_row)?;
+
+    // D25: register the freshly-written blob in content_blobs so future
+    // duplicates dedup against it. Only for immutable single-replica
+    // writes (the same condition we use to look up). Stores the LOGICAL
+    // backend_path; the .zst suffix is added by the read path based on
+    // the compressed flag.
+    if row.mutability == crate::index::Mutability::Immutable && !is_mirror {
+        if let Some(h) = final_hash {
+            let _ = index.register_blob(crate::index::BlobRef {
+                hash: h,
+                tier: target_tier,
+                backend_id: primary.id().to_string(),
+                backend_path: dst_path.clone(),
+                size: row.location.size,
+                compressed: should_compress,
+            });
+        }
+    }
 
     // 4. Best-effort source unlink. Orphans cleaned by startup scrub /
     //    fsck. For mirror migration the "source" can itself be one of the
@@ -407,11 +506,9 @@ fn evict_cold(
 
     // Chain 2: Slow → Archive, only when an archive tier is configured.
     if router.has_archive() {
-        // Use the archive-specific watermark + min-age. Same shape as chain 1
-        // but with the slow tier's capacity as the source.
+        // Standard age-gated chain for all files.
         let slow_usage = router.slow.usage_ratio();
         if slow_usage > policy.slow_archive_watermark() {
-            // Bring slow back down to (slow_archive_watermark - 0.10).
             let target_usage = (policy.slow_archive_watermark() - 0.10).max(0.0);
             evict_chain(
                 router,
@@ -419,12 +516,50 @@ fn evict_cold(
                 open_tracker,
                 TierId::Slow,
                 TierId::Archive,
-                target_usage, // unused — we recompute to_free below
+                target_usage,
                 policy.slow_archive_watermark(),
                 policy.min_age_to_archive(),
                 || router.slow.capacity(),
                 || router.slow.usage_ratio(),
             );
+        }
+        // D24: aggressive demotion for immutable Slow-tier files. Skip the
+        // age check entirely — if a file is declared immutable and is the
+        // coldest by popularity, send it to Archive regardless of how
+        // recently it was accessed. The watermark still gates so we don't
+        // demote when Slow is nearly empty.
+        if router.slow.usage_ratio() > policy.low_watermark() {
+            evict_immutable_to_archive(router, index, open_tracker);
+        }
+    }
+}
+
+fn evict_immutable_to_archive(
+    router: &TierRouter,
+    index: &Arc<dyn PathIndex>,
+    open_tracker: &Arc<OpenFileTracker>,
+) {
+    // Cheap: pull a handful of coldest Slow rows with min_age=0, filter
+    // for immutable, demote. Cap at 100 to avoid hot-loops on giant indexes.
+    let coldest = match index.coldest(TierId::Slow, u64::MAX, std::time::Duration::ZERO) {
+        Ok(c) => c,
+        Err(e) => {
+            warn!("evict_immutable: coldest query: {:?}", e);
+            return;
+        }
+    };
+    for (path, _size) in coldest.into_iter().take(100) {
+        let row = match index.get(&path).ok().flatten() {
+            Some(r) => r,
+            None => continue,
+        };
+        if row.mutability != crate::index::Mutability::Immutable {
+            continue;
+        }
+        match migrate(router, index, open_tracker, &path, TierId::Archive) {
+            Ok(true) => debug!("immutable demote {} → Archive", path.display()),
+            Ok(false) => {}
+            Err(e) => warn!("immutable migrate {}: {:?}", path.display(), e),
         }
     }
 }
@@ -539,6 +674,9 @@ mod tests {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         }
     }
 

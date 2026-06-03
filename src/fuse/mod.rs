@@ -201,27 +201,55 @@ impl FuseState {
     /// doesn't break access if another replica is reachable. Slightly more
     /// expensive than `resolve` (full row + extra exists check) — only call
     /// on cold paths (open, lookup), not on every read/write.
+    ///
+    /// D24: if the file is `compressed=true`, decompress to a staging file
+    /// and return the staging path so subsequent read/writes are native-
+    /// POSIX speed.
     fn resolve_with_fallback(&self, logical: &Path) -> Option<(Arc<dyn Backend>, PathBuf)> {
         let row = self.index.get(logical).ok().flatten()?;
-        // Try primary first.
-        if let Some(primary) = self.router.resolve_backend(row.location.tier, &row.location.backend_id) {
-            if primary.exists(&row.location.backend_path).unwrap_or(false) {
-                return Some((Arc::clone(primary), row.location.backend_path));
+        let compressed = row.compressed;
+        let logical_size = row.location.size;
+
+        let pick = |backend_id: &str, backend_path: &Path| -> Option<(Arc<dyn Backend>, PathBuf)> {
+            let b = self.router.resolve_backend(row.location.tier, backend_id)?;
+            // Translate to the actual on-disk path. Compressed files live
+            // at `<path>.zst`; exists() checks the .zst.
+            let probe = if compressed {
+                crate::tierer::compress::compressed_path(backend_path)
+            } else {
+                backend_path.to_path_buf()
+            };
+            if !b.exists(&probe).unwrap_or(false) {
+                return None;
             }
+            if compressed {
+                match crate::tierer::ensure_decompressed(b, backend_path, logical_size) {
+                    Ok(staging_abs) => Some((Arc::clone(b), staging_abs)),
+                    Err(e) => {
+                        warn!("decompress {} failed: {:?}", backend_path.display(), e);
+                        None
+                    }
+                }
+            } else {
+                Some((Arc::clone(b), backend_path.to_path_buf()))
+            }
+        };
+
+        // Try primary first.
+        if let Some(r) = pick(&row.location.backend_id, &row.location.backend_path) {
+            return Some(r);
         }
         // Then each replica in order. Skip the primary (already tried).
         for rep in &row.replicas {
             if rep.backend_id == row.location.backend_id {
                 continue;
             }
-            if let Some(b) = self.router.resolve_backend(row.location.tier, &rep.backend_id) {
-                if b.exists(&rep.backend_path).unwrap_or(false) {
-                    debug!(
-                        "open replica fallback: {} → {}",
-                        row.location.backend_id, rep.backend_id
-                    );
-                    return Some((Arc::clone(b), rep.backend_path.clone()));
-                }
+            if let Some(r) = pick(&rep.backend_id, &rep.backend_path) {
+                debug!(
+                    "open replica fallback: {} → {}",
+                    row.location.backend_id, rep.backend_id
+                );
+                return Some(r);
             }
         }
         None
@@ -599,12 +627,15 @@ impl Filesystem for FuseAdapter {
                 backend_path: rel.clone(),
                 size: meta.size,
             },
-            replicas: Vec::new(), // new files start single-replica; mirror is applied at first migrate
+            replicas: Vec::new(),
             last_access: SystemTime::now(),
             hit_count: 0,
             popularity: self.state.policy.initial_popularity(), // D17
             pinned_tier: None,
             state: FileState::Stable,
+            mutability: crate::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         };
         if let Err(e) = self.state.index.insert(row) {
             reply.error(errno(&e));
@@ -662,13 +693,42 @@ impl Filesystem for FuseAdapter {
             reply.error(ENOENT);
             return;
         };
+        // D25: dedup-aware unlink. If the file is part of a deduped blob,
+        // unref it; only delete the physical file when refcount → 0.
+        let row = self.state.index.get(&logical).ok().flatten();
         let Some((backend, bpath)) = self.state.resolve(&logical) else {
             reply.error(ENOENT);
             return;
         };
-        if let Err(e) = backend.remove(&bpath) {
-            reply.error(errno(&e));
-            return;
+        let mut should_remove_physical = true;
+        if let Some(r) = &row {
+            if let Some(hash) = &r.content_hash {
+                match self.state.index.unref_blob(hash) {
+                    Ok(true) => {
+                        // Refcount hit 0 — last reference. Delete physical.
+                        should_remove_physical = true;
+                    }
+                    Ok(false) => {
+                        // Other files still reference this blob — leave it.
+                        should_remove_physical = false;
+                    }
+                    Err(e) => {
+                        warn!("unref_blob {}: {:?}", logical.display(), e);
+                    }
+                }
+            }
+        }
+        if should_remove_physical {
+            // For compressed files the on-disk file has a .zst suffix.
+            let on_disk = if row.as_ref().map(|r| r.compressed).unwrap_or(false) {
+                crate::tierer::compress::compressed_path(&bpath)
+            } else {
+                bpath.clone()
+            };
+            if let Err(e) = backend.remove(&on_disk) {
+                reply.error(errno(&e));
+                return;
+            }
         }
         if let Err(e) = self.state.index.remove(&logical) {
             warn!("index.remove {}: {:?}", logical.display(), e);

@@ -79,6 +79,9 @@ fn mirror_migration_writes_to_all_backends() {
             popularity: 0.0,
             pinned_tier: None,
             state: FileState::Stable,
+            mutability: rhss::index::Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         })
         .unwrap();
 

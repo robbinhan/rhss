@@ -90,6 +90,15 @@ pub struct FileRow {
     pub popularity: f64,
     pub pinned_tier: Option<TierId>,
     pub state: FileState,
+    /// D24: mutability hint. Drives aggressive demotion + compression.
+    pub mutability: Mutability,
+    /// D24: file is stored zstd-compressed on its current backend (Slow
+    /// tier optimization for immutable files). When true, `location.size`
+    /// is the LOGICAL size, not the on-disk size of the .zst file.
+    pub compressed: bool,
+    /// D25: sha256 hex (lowercase, 64 chars) when known. Computed on
+    /// immutable promotion; used for dedup lookup and fsck integrity check.
+    pub content_hash: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -97,6 +106,42 @@ pub enum FileState {
     Stable,
     Migrating,
     Scanning,
+}
+
+/// File mutability — does the user expect this file's content to keep
+/// changing, or is it write-once? Drives aggressive archive demotion,
+/// zstd compression on Slow, and content-addressable dedup (D24/D25).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Mutability {
+    /// Default for new files and v2.3-era unmigrated rows. Conservative —
+    /// tierer treats it like mutable.
+    Unknown,
+    /// File is expected to be edited. No compression, no dedup, normal
+    /// min_age_to_archive applies.
+    Mutable,
+    /// File is declared write-once. Tierer can skip min_age_to_archive;
+    /// Slow tier may compress; can be deduped against other immutable
+    /// files with the same content_hash.
+    Immutable,
+}
+
+impl Mutability {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Mutability::Unknown => "unknown",
+            Mutability::Mutable => "mutable",
+            Mutability::Immutable => "immutable",
+        }
+    }
+
+    pub fn parse(s: &str) -> Result<Self> {
+        match s {
+            "unknown" => Ok(Mutability::Unknown),
+            "mutable" => Ok(Mutability::Mutable),
+            "immutable" => Ok(Mutability::Immutable),
+            other => Err(FsError::Storage(format!("unknown mutability: {other}"))),
+        }
+    }
 }
 
 impl FileState {
@@ -151,6 +196,39 @@ pub trait PathIndex: Send + Sync {
 
     /// Every row with `pinned_tier` set. Used by `rhss list-pinned`.
     fn list_pinned(&self) -> Result<Vec<FileRow>>;
+
+    /// Update just the mutability flag for a file. Used by `rhss lock/unlock`
+    /// and by the auto-detect sweeper. Other columns untouched.
+    fn set_mutability(&self, logical: &Path, m: Mutability) -> Result<()>;
+
+    /// Compute and write content_hash for an immutable file. Caller hashes
+    /// the data; we just record it.
+    fn set_content_hash(&self, logical: &Path, hash: &str) -> Result<()>;
+
+    // ===== Content-blob (dedup) helpers =====
+
+    /// Look up an existing physical blob by hash. Returns None if no file
+    /// with that content has been deduped yet.
+    fn lookup_blob(&self, hash: &str) -> Result<Option<BlobRef>>;
+
+    /// Register a new physical blob. Refcount starts at 1. Idempotent —
+    /// safe to call when the row already exists (refcount += 1).
+    fn register_blob(&self, blob: BlobRef) -> Result<()>;
+
+    /// Decrement refcount on a blob. Returns true if it reached 0 and the
+    /// physical file should be deleted.
+    fn unref_blob(&self, hash: &str) -> Result<bool>;
+}
+
+/// One physical-blob row in `content_blobs`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlobRef {
+    pub hash: String,
+    pub tier: TierId,
+    pub backend_id: String,
+    pub backend_path: PathBuf,
+    pub size: u64,
+    pub compressed: bool,
 }
 
 /// SQLite-backed PathIndex with an LRU cache for hot lookups.
@@ -189,8 +267,32 @@ impl SqlitePathIndex {
         )
         .map_err(|e| FsError::Storage(format!("init schema: {e}")))?;
 
-        // D23 migration: add `replicas` column if not present. Idempotent.
-        Self::migrate_add_replicas(&conn)?;
+        // D23 + D24/D25 migrations: add columns if not present. Idempotent.
+        Self::migrate_add_column(&conn, "replicas", "TEXT")?;
+        Self::migrate_add_column(
+            &conn,
+            "mutability",
+            "TEXT NOT NULL DEFAULT 'unknown'",
+        )?;
+        Self::migrate_add_column(&conn, "compressed", "INTEGER NOT NULL DEFAULT 0")?;
+        Self::migrate_add_column(&conn, "content_hash", "TEXT")?;
+        // Reverse index for content-addressable dedup (D25).
+        conn.execute_batch(
+            r#"
+            CREATE TABLE IF NOT EXISTS content_blobs (
+                hash             TEXT PRIMARY KEY,
+                tier             TEXT NOT NULL,
+                backend_id       TEXT NOT NULL,
+                backend_path     TEXT NOT NULL,
+                size             INTEGER NOT NULL,
+                compressed       INTEGER NOT NULL DEFAULT 0,
+                refcount         INTEGER NOT NULL DEFAULT 1
+            );
+            CREATE INDEX IF NOT EXISTS idx_blob_backend
+                ON content_blobs(tier, backend_id);
+            "#,
+        )
+        .map_err(|e| FsError::Storage(format!("init dedup schema: {e}")))?;
 
         Ok(Arc::new(Self {
             inner: Mutex::new(conn),
@@ -198,7 +300,7 @@ impl SqlitePathIndex {
         }))
     }
 
-    fn migrate_add_replicas(conn: &Connection) -> Result<()> {
+    fn migrate_add_column(conn: &Connection, col: &str, decl: &str) -> Result<()> {
         // PRAGMA table_info returns (cid, name, type, notnull, dflt, pk).
         let has_col: bool = {
             let mut stmt = conn
@@ -213,7 +315,7 @@ impl SqlitePathIndex {
                 .map_err(|e| FsError::Storage(format!("pragma row: {e}")))?
             {
                 let name: String = r.get(1).unwrap_or_default();
-                if name == "replicas" {
+                if name == col {
                     found = true;
                     break;
                 }
@@ -221,8 +323,9 @@ impl SqlitePathIndex {
             found
         };
         if !has_col {
-            conn.execute("ALTER TABLE files ADD COLUMN replicas TEXT", [])
-                .map_err(|e| FsError::Storage(format!("add replicas col: {e}")))?;
+            let sql = format!("ALTER TABLE files ADD COLUMN {col} {decl}");
+            conn.execute(&sql, [])
+                .map_err(|e| FsError::Storage(format!("add {col} col: {e}")))?;
         }
         Ok(())
     }
@@ -285,7 +388,7 @@ impl PathIndex for SqlitePathIndex {
         let conn = self.inner.lock();
         let row = conn
             .query_row(
-                "SELECT tier, backend_id, backend_path, size, last_access, hit_count, popularity, pinned_tier, state, replicas
+                "SELECT tier, backend_id, backend_path, size, last_access, hit_count, popularity, pinned_tier, state, replicas, mutability, compressed, content_hash
                  FROM files WHERE logical_path = ?1",
                 params![logical.to_string_lossy().as_ref()],
                 |r| {
@@ -300,13 +403,29 @@ impl PathIndex for SqlitePathIndex {
                         r.get::<_, Option<String>>(7)?,
                         r.get::<_, String>(8)?,
                         r.get::<_, Option<String>>(9)?,
+                        r.get::<_, String>(10)?,
+                        r.get::<_, i64>(11)?,
+                        r.get::<_, Option<String>>(12)?,
                     ))
                 },
             )
             .optional()
             .map_err(|e| FsError::Storage(format!("get: {e}")))?;
-        let Some((tier, backend_id, backend_path, size, atime, hits, pop, pinned, state, replicas)) =
-            row
+        let Some((
+            tier,
+            backend_id,
+            backend_path,
+            size,
+            atime,
+            hits,
+            pop,
+            pinned,
+            state,
+            replicas,
+            mutability,
+            compressed,
+            content_hash,
+        )) = row
         else {
             return Ok(None);
         };
@@ -326,6 +445,9 @@ impl PathIndex for SqlitePathIndex {
             popularity: pop,
             pinned_tier,
             state: FileState::parse(&state)?,
+            mutability: Mutability::parse(&mutability)?,
+            compressed: compressed != 0,
+            content_hash,
         }))
     }
 
@@ -335,8 +457,9 @@ impl PathIndex for SqlitePathIndex {
         conn.execute(
             "INSERT OR REPLACE INTO files
              (logical_path, tier, backend_id, backend_path, size, last_access,
-              hit_count, popularity, pinned_tier, state, replicas)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+              hit_count, popularity, pinned_tier, state, replicas,
+              mutability, compressed, content_hash)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
             params![
                 row.logical_path.to_string_lossy().as_ref(),
                 row.location.tier.as_str(),
@@ -349,6 +472,9 @@ impl PathIndex for SqlitePathIndex {
                 row.pinned_tier.map(|t| t.as_str()),
                 row.state.as_str(),
                 replicas_json,
+                row.mutability.as_str(),
+                if row.compressed { 1i64 } else { 0i64 },
+                row.content_hash,
             ],
         )
         .map_err(|e| FsError::Storage(format!("insert: {e}")))?;
@@ -477,7 +603,8 @@ impl PathIndex for SqlitePathIndex {
             (
                 format!(
                     "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                            hit_count, popularity, pinned_tier, state, replicas
+                            hit_count, popularity, pinned_tier, state, replicas,
+                        mutability, compressed, content_hash
                        FROM files WHERE tier = ?1
                        ORDER BY popularity {order}, last_access {order}
                        LIMIT ?2"
@@ -488,7 +615,8 @@ impl PathIndex for SqlitePathIndex {
             (
                 format!(
                     "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                            hit_count, popularity, pinned_tier, state, replicas
+                            hit_count, popularity, pinned_tier, state, replicas,
+                        mutability, compressed, content_hash
                        FROM files
                        ORDER BY popularity {order}, last_access {order}
                        LIMIT ?1"
@@ -539,12 +667,142 @@ impl PathIndex for SqlitePathIndex {
         Ok(out)
     }
 
+    fn set_mutability(&self, logical: &Path, m: Mutability) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn
+            .execute(
+                "UPDATE files SET mutability = ?2 WHERE logical_path = ?1",
+                params![logical.to_string_lossy().as_ref(), m.as_str()],
+            )
+            .map_err(|e| FsError::Storage(format!("set_mutability: {e}")))?;
+        if n == 0 {
+            return Err(FsError::NotFound(logical.to_string_lossy().to_string()));
+        }
+        Ok(())
+    }
+
+    fn set_content_hash(&self, logical: &Path, hash: &str) -> Result<()> {
+        let conn = self.inner.lock();
+        let n = conn
+            .execute(
+                "UPDATE files SET content_hash = ?2 WHERE logical_path = ?1",
+                params![logical.to_string_lossy().as_ref(), hash],
+            )
+            .map_err(|e| FsError::Storage(format!("set_content_hash: {e}")))?;
+        if n == 0 {
+            return Err(FsError::NotFound(logical.to_string_lossy().to_string()));
+        }
+        Ok(())
+    }
+
+    fn lookup_blob(&self, hash: &str) -> Result<Option<BlobRef>> {
+        let conn = self.inner.lock();
+        conn.query_row(
+            "SELECT hash, tier, backend_id, backend_path, size, compressed
+               FROM content_blobs WHERE hash = ?1",
+            params![hash],
+            |r| {
+                Ok((
+                    r.get::<_, String>(0)?,
+                    r.get::<_, String>(1)?,
+                    r.get::<_, String>(2)?,
+                    r.get::<_, String>(3)?,
+                    r.get::<_, i64>(4)?,
+                    r.get::<_, i64>(5)?,
+                ))
+            },
+        )
+        .optional()
+        .map_err(|e| FsError::Storage(format!("lookup_blob: {e}")))?
+        .map(|(hash, tier, bid, bpath, size, compressed)| {
+            Ok(BlobRef {
+                hash,
+                tier: TierId::parse(&tier)?,
+                backend_id: bid,
+                backend_path: PathBuf::from(bpath),
+                size: size as u64,
+                compressed: compressed != 0,
+            })
+        })
+        .transpose()
+    }
+
+    fn register_blob(&self, blob: BlobRef) -> Result<()> {
+        let conn = self.inner.lock();
+        // Upsert: if hash already exists, bump refcount. Otherwise insert
+        // with refcount=1.
+        let exists = conn
+            .query_row(
+                "SELECT refcount FROM content_blobs WHERE hash = ?1",
+                params![blob.hash],
+                |r| r.get::<_, i64>(0),
+            )
+            .optional()
+            .map_err(|e| FsError::Storage(format!("register_blob check: {e}")))?;
+        match exists {
+            Some(_) => {
+                conn.execute(
+                    "UPDATE content_blobs SET refcount = refcount + 1 WHERE hash = ?1",
+                    params![blob.hash],
+                )
+                .map_err(|e| FsError::Storage(format!("register_blob ref: {e}")))?;
+            }
+            None => {
+                conn.execute(
+                    "INSERT INTO content_blobs
+                     (hash, tier, backend_id, backend_path, size, compressed, refcount)
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, 1)",
+                    params![
+                        blob.hash,
+                        blob.tier.as_str(),
+                        blob.backend_id,
+                        blob.backend_path.to_string_lossy().as_ref(),
+                        blob.size as i64,
+                        if blob.compressed { 1i64 } else { 0i64 },
+                    ],
+                )
+                .map_err(|e| FsError::Storage(format!("register_blob ins: {e}")))?;
+            }
+        }
+        Ok(())
+    }
+
+    fn unref_blob(&self, hash: &str) -> Result<bool> {
+        let conn = self.inner.lock();
+        conn.execute(
+            "UPDATE content_blobs SET refcount = refcount - 1 WHERE hash = ?1",
+            params![hash],
+        )
+        .map_err(|e| FsError::Storage(format!("unref_blob: {e}")))?;
+        let remaining: Option<i64> = conn
+            .query_row(
+                "SELECT refcount FROM content_blobs WHERE hash = ?1",
+                params![hash],
+                |r| r.get(0),
+            )
+            .optional()
+            .map_err(|e| FsError::Storage(format!("unref_blob read: {e}")))?;
+        match remaining {
+            Some(0) => {
+                conn.execute(
+                    "DELETE FROM content_blobs WHERE hash = ?1",
+                    params![hash],
+                )
+                .map_err(|e| FsError::Storage(format!("unref_blob del: {e}")))?;
+                Ok(true)
+            }
+            Some(_) => Ok(false),
+            None => Ok(false),
+        }
+    }
+
     fn list_pinned(&self) -> Result<Vec<FileRow>> {
         let conn = self.inner.lock();
         let mut stmt = conn
             .prepare(
                 "SELECT logical_path, tier, backend_id, backend_path, size, last_access,
-                        hit_count, popularity, pinned_tier, state, replicas
+                        hit_count, popularity, pinned_tier, state, replicas,
+                        mutability, compressed, content_hash
                    FROM files
                    WHERE pinned_tier IS NOT NULL
                    ORDER BY logical_path",
@@ -565,12 +823,15 @@ type RawRow = (
     String,         // backend_id
     String,         // backend_path
     i64,            // size
-    i64,            // last_access (unix secs)
+    i64,            // last_access
     i64,            // hit_count
     f64,            // popularity
     Option<String>, // pinned_tier
     String,         // state
     Option<String>, // replicas JSON
+    String,         // mutability
+    i64,            // compressed
+    Option<String>, // content_hash
 );
 
 fn parse_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
@@ -586,11 +847,29 @@ fn parse_row(r: &rusqlite::Row<'_>) -> rusqlite::Result<RawRow> {
         r.get(8)?,
         r.get(9)?,
         r.get(10)?,
+        r.get(11)?,
+        r.get(12)?,
+        r.get(13)?,
     ))
 }
 
 fn row_to_file(raw: RawRow) -> Result<FileRow> {
-    let (lp, tier, bid, bpath, size, atime, hits, pop, pinned, state, replicas) = raw;
+    let (
+        lp,
+        tier,
+        bid,
+        bpath,
+        size,
+        atime,
+        hits,
+        pop,
+        pinned,
+        state,
+        replicas,
+        mutability,
+        compressed,
+        content_hash,
+    ) = raw;
     let pinned_tier = pinned.map(|s| TierId::parse(&s)).transpose()?;
     let replicas = parse_replicas(replicas)?;
     Ok(FileRow {
@@ -607,6 +886,9 @@ fn row_to_file(raw: RawRow) -> Result<FileRow> {
         popularity: pop,
         pinned_tier,
         state: FileState::parse(&state)?,
+        mutability: Mutability::parse(&mutability)?,
+        compressed: compressed != 0,
+        content_hash,
     })
 }
 
@@ -648,6 +930,9 @@ mod tests {
             pinned_tier: None,
             state: FileState::Stable,
             replicas: Vec::new(),
+            mutability: Mutability::Unknown,
+            compressed: false,
+            content_hash: None,
         }
     }
 

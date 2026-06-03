@@ -47,12 +47,15 @@ pub enum Request {
     Ping,
     Pin { path: PathBuf, tier: Tier },
     Unpin { path: PathBuf },
+    Lock { path: PathBuf },
+    Unlock { path: PathBuf },
     Oneshot { wait: bool },
     Migrate { path: PathBuf, to: Tier },
     Freeze,
     Unfreeze,
     Fsck { repair: bool },
     Rescan,
+    DedupGc,
 }
 
 /// Responses share an envelope: `ok` + optional `data` + optional `error`.
@@ -109,6 +112,8 @@ pub enum ResponseData {
     Pong { version: String, frozen: bool },
     /// `pin` / `unpin` response: confirms what's now in the row.
     Pinned { path: PathBuf, tier: Option<Tier> },
+    /// `lock` / `unlock` response: confirms new mutability.
+    Mutability { path: PathBuf, immutable: bool },
     /// `oneshot` response: whether the wait actually completed in time.
     OneshotCompleted { waited: bool },
     /// `migrate` response: did the migration happen, or skipped (open / pinned).
@@ -135,6 +140,12 @@ pub enum ResponseData {
         added: u64,
         already_indexed: u64,
         conflicts: Vec<PathBuf>,
+    },
+    /// `dedup-gc` response.
+    DedupGc {
+        blobs_scanned: u64,
+        blobs_removed: u64,
+        bytes_freed: u64,
     },
 }
 

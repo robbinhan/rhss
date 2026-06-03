@@ -77,6 +77,13 @@ pub enum Cmd {
     /// Clear a file's tier pin.
     Unpin(WhichArgs),
 
+    /// Mark a file immutable (write-once). Tierer can demote aggressively;
+    /// Slow tier may compress; can be deduped with other identical files.
+    Lock(WhichArgs),
+
+    /// Mark a file mutable again. Reverses `lock`.
+    Unlock(WhichArgs),
+
     /// Trigger one tier-eviction cycle immediately.
     Oneshot(OneshotArgs),
 
@@ -94,6 +101,9 @@ pub enum Cmd {
 
     /// Re-scan backends to ingest newly-dropped files.
     Rescan,
+
+    /// Sweep orphan dedup blobs.
+    DedupGc,
 
     /// Health-check the control socket.
     Ping,
@@ -213,12 +223,15 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Replicas(args) => inspect::replicas(&ctx, args),
         Cmd::Pin(args) => control::pin(&ctx, args),
         Cmd::Unpin(args) => control::unpin(&ctx, args),
+        Cmd::Lock(args) => control::lock(&ctx, args, true),
+        Cmd::Unlock(args) => control::lock(&ctx, args, false),
         Cmd::Oneshot(args) => control::oneshot(&ctx, args),
         Cmd::Migrate(args) => control::migrate(&ctx, args),
         Cmd::Freeze => control::freeze(&ctx, true),
         Cmd::Unfreeze => control::freeze(&ctx, false),
         Cmd::Fsck(args) => control::fsck(&ctx, args),
         Cmd::Rescan => control::rescan(&ctx),
+        Cmd::DedupGc => control::dedup_gc(&ctx),
         Cmd::Ping => control::ping(&ctx),
         Cmd::Config(c) => config_cmd::run(&ctx, c),
     }

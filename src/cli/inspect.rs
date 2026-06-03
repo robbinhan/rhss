@@ -183,6 +183,13 @@ fn print_explain(r: &FileRow) {
         Some(t) => println!("Pinned:       yes → {}", tier_name(t)),
         None => println!("Pinned:       no"),
     }
+    println!("Mutability:   {:?}", r.mutability);
+    if r.compressed {
+        println!("Compressed:   yes (zstd)");
+    }
+    if let Some(h) = &r.content_hash {
+        println!("Content hash: {}", h);
+    }
     println!("State:        {:?}", r.state);
 }
 
