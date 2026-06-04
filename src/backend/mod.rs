@@ -102,4 +102,11 @@ pub trait Backend: Send + Sync {
     /// Resolve a logical-relative path to the absolute path on the backing disk.
     /// Used by FUSE `open` to get the real fd that goes into `fi->fh`.
     fn resolve(&self, path: &Path) -> PathBuf;
+
+    /// D26: declared cost per GiB per month. `None` means the backend
+    /// hasn't declared a cost (treat as free for placement purposes). Used
+    /// by `CostAwarePlacement` and `rhss cost`.
+    fn cost_per_gb_month(&self) -> Option<f64> {
+        None
+    }
 }

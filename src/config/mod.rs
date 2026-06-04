@@ -63,6 +63,12 @@ pub struct TierPolicy {
 pub struct BackendConfig {
     pub id: String,
     pub root: PathBuf,
+    /// Declared cost in USD per GiB per month (D26). Used by
+    /// `CostAwarePlacement` and by `rhss cost` projections. Optional —
+    /// when unset, the backend is treated as "free" (cost-aware placement
+    /// falls back to MostFree).
+    #[serde(default)]
+    pub cost_per_gb_month: Option<f64>,
 }
 
 /// S3-compatible archive backend. Works with AWS S3, Cloudflare R2,
@@ -93,6 +99,12 @@ pub struct ArchiveBackendConfig {
     /// `<prefix>/<logical_path>`). Default empty.
     #[serde(default)]
     pub prefix: String,
+    /// Declared cost in USD per GiB per month (D26). Used by
+    /// `CostAwarePlacement` and `rhss cost`. AWS S3 STANDARD_IA ≈ 0.0125;
+    /// Cloudflare R2 ≈ 0.015 (no egress); Backblaze B2 ≈ 0.006; AWS Deep
+    /// Archive ≈ 0.001.
+    #[serde(default)]
+    pub cost_per_gb_month: Option<f64>,
 }
 
 fn default_region() -> String {

@@ -99,6 +99,71 @@ impl Default for MirrorPlacement {
     }
 }
 
+/// Cost-aware placement (D26). Picks the **cheapest** backend with at
+/// least `min_free_bytes` available. Backends without a declared
+/// `cost_per_gb_month` are treated as infinitely expensive — i.e. they
+/// only get chosen when every priced backend is full.
+///
+/// When NO backend has declared a cost, falls back to `MostFreePlacement`
+/// behavior so users can switch to `cost_aware` without immediately
+/// breaking when they forget to add costs.
+pub struct CostAwarePlacement {
+    pub min_free_bytes: u64,
+}
+
+impl CostAwarePlacement {
+    pub fn new() -> Self {
+        Self {
+            min_free_bytes: 1024 * 1024 * 1024, // 1 GiB headroom
+        }
+    }
+
+    pub fn with_headroom(min_free_bytes: u64) -> Self {
+        Self { min_free_bytes }
+    }
+}
+
+impl Default for CostAwarePlacement {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Placement for CostAwarePlacement {
+    fn pick<'a>(&self, backends: &'a [Arc<dyn Backend>]) -> Result<&'a Arc<dyn Backend>> {
+        if backends.is_empty() {
+            return Err(FsError::Storage("cost-aware: empty backend list".into()));
+        }
+        // Check if ANY backend has a declared cost. If not, fall through
+        // to MostFree so the flag is forgiving in misconfigurations.
+        let any_priced = backends.iter().any(|b| b.cost_per_gb_month().is_some());
+        if !any_priced {
+            return MostFreePlacement.pick(backends);
+        }
+
+        let mut best: Option<(f64, &Arc<dyn Backend>)> = None;
+        for b in backends {
+            let free = b.statvfs().map(|s| s.free_bytes).unwrap_or(0);
+            if free < self.min_free_bytes {
+                continue;
+            }
+            // Backends without a cost are treated as infinitely expensive.
+            // They still beat "no backend at all" but lose to any priced
+            // backend with room.
+            let cost = b.cost_per_gb_month().unwrap_or(f64::INFINITY);
+            match best {
+                Some((existing, _)) if cost >= existing => {}
+                _ => best = Some((cost, b)),
+            }
+        }
+        best.map(|(_, b)| b).ok_or_else(|| {
+            FsError::Storage(
+                "cost-aware: no backend has enough free space (min_free_bytes)".into(),
+            )
+        })
+    }
+}
+
 impl Placement for MirrorPlacement {
     fn pick<'a>(&self, backends: &'a [Arc<dyn Backend>]) -> Result<&'a Arc<dyn Backend>> {
         if backends.is_empty() {
@@ -202,6 +267,155 @@ mod tests {
         let p = MostFreePlacement;
         let chosen = p.pick(&bs).unwrap();
         assert_eq!(chosen.id(), "b");
+    }
+
+    struct CostBackend {
+        id: String,
+        free: u64,
+        cost: Option<f64>,
+    }
+    impl Backend for CostBackend {
+        fn id(&self) -> &str {
+            &self.id
+        }
+        fn root(&self) -> &Path {
+            Path::new("/tmp")
+        }
+        fn resolve(&self, _: &Path) -> PathBuf {
+            PathBuf::new()
+        }
+        fn read_at(&self, _: &Path, _: u64, _: u32) -> Result<Vec<u8>> {
+            unimplemented!()
+        }
+        fn write_at(&self, _: &Path, _: u64, _: &[u8]) -> Result<u32> {
+            unimplemented!()
+        }
+        fn truncate(&self, _: &Path, _: u64) -> Result<()> {
+            unimplemented!()
+        }
+        fn fsync(&self, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn metadata(&self, _: &Path) -> Result<crate::backend::FileMetadata> {
+            unimplemented!()
+        }
+        fn exists(&self, _: &Path) -> Result<bool> {
+            unimplemented!()
+        }
+        fn list_dir(&self, _: &Path) -> Result<Vec<String>> {
+            unimplemented!()
+        }
+        fn create_dir(&self, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn create_file(&self, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn remove(&self, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn rename(&self, _: &Path, _: &Path) -> Result<()> {
+            unimplemented!()
+        }
+        fn set_permissions(&self, _: &Path, _: u32) -> Result<()> {
+            unimplemented!()
+        }
+        fn set_times(
+            &self,
+            _: &Path,
+            _: Option<std::time::SystemTime>,
+            _: Option<std::time::SystemTime>,
+        ) -> Result<()> {
+            unimplemented!()
+        }
+        fn statvfs(&self) -> Result<BackendStats> {
+            Ok(BackendStats {
+                total_bytes: 1_000_000_000_000,
+                free_bytes: self.free,
+                used_bytes: 1_000_000_000_000 - self.free,
+            })
+        }
+        fn cost_per_gb_month(&self) -> Option<f64> {
+            self.cost
+        }
+    }
+
+    #[test]
+    fn cost_aware_picks_cheapest_priced_backend() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(CostBackend {
+                id: "r2".into(),
+                free: 100 * 1024 * 1024 * 1024, // 100 GiB free
+                cost: Some(0.015),
+            }),
+            Arc::new(CostBackend {
+                id: "b2".into(),
+                free: 50 * 1024 * 1024 * 1024,
+                cost: Some(0.006),
+            }),
+            Arc::new(CostBackend {
+                id: "expensive".into(),
+                free: 1_000_000_000_000,
+                cost: Some(0.023),
+            }),
+        ];
+        let p = CostAwarePlacement::new();
+        assert_eq!(p.pick(&bs).unwrap().id(), "b2");
+    }
+
+    #[test]
+    fn cost_aware_skips_full_backends() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(CostBackend {
+                id: "cheap-full".into(),
+                free: 100, // way under headroom
+                cost: Some(0.001),
+            }),
+            Arc::new(CostBackend {
+                id: "expensive-roomy".into(),
+                free: 1_000_000_000_000,
+                cost: Some(0.10),
+            }),
+        ];
+        let p = CostAwarePlacement::with_headroom(1024 * 1024 * 1024);
+        assert_eq!(p.pick(&bs).unwrap().id(), "expensive-roomy");
+    }
+
+    #[test]
+    fn cost_aware_falls_back_when_no_costs_declared() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(CostBackend {
+                id: "a".into(),
+                free: 100 * 1024 * 1024 * 1024,
+                cost: None,
+            }),
+            Arc::new(CostBackend {
+                id: "b".into(),
+                free: 500 * 1024 * 1024 * 1024,
+                cost: None,
+            }),
+        ];
+        let p = CostAwarePlacement::new();
+        // Falls back to MostFree → b has more free.
+        assert_eq!(p.pick(&bs).unwrap().id(), "b");
+    }
+
+    #[test]
+    fn cost_aware_prefers_priced_over_unpriced() {
+        let bs: Vec<Arc<dyn Backend>> = vec![
+            Arc::new(CostBackend {
+                id: "free-but-unknown".into(),
+                free: 1_000_000_000_000,
+                cost: None,
+            }),
+            Arc::new(CostBackend {
+                id: "priced".into(),
+                free: 100 * 1024 * 1024 * 1024,
+                cost: Some(0.01),
+            }),
+        ];
+        let p = CostAwarePlacement::new();
+        assert_eq!(p.pick(&bs).unwrap().id(), "priced");
     }
 
     #[test]

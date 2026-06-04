@@ -69,6 +69,9 @@ pub enum Cmd {
     /// All replica locations for a file (mirror tiers).
     Replicas(WhichArgs),
 
+    /// Project monthly storage cost based on per-backend cost_per_gb_month.
+    Cost,
+
     // === control (require daemon) ===
 
     /// Pin a file to a tier so the tierer never evicts it.
@@ -221,6 +224,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Cmd::Coldest(args) => inspect::coldest(&ctx, args),
         Cmd::ListPinned => inspect::list_pinned(&ctx),
         Cmd::Replicas(args) => inspect::replicas(&ctx, args),
+        Cmd::Cost => status::cost(&ctx),
         Cmd::Pin(args) => control::pin(&ctx, args),
         Cmd::Unpin(args) => control::unpin(&ctx, args),
         Cmd::Lock(args) => control::lock(&ctx, args, true),

@@ -16,11 +16,21 @@ use super::{Backend, BackendStats, FileMetadata};
 pub struct PosixBackend {
     id: String,
     root: PathBuf,
+    cost_per_gb_month: Option<f64>,
 }
 
 impl PosixBackend {
     /// Create a new backend rooted at `root`. The directory must exist.
     pub fn new(id: impl Into<String>, root: impl Into<PathBuf>) -> Result<Self> {
+        Self::with_cost(id, root, None)
+    }
+
+    /// Create with an explicit cost-per-GiB-per-month declaration (D26).
+    pub fn with_cost(
+        id: impl Into<String>,
+        root: impl Into<PathBuf>,
+        cost_per_gb_month: Option<f64>,
+    ) -> Result<Self> {
         let id = id.into();
         let root = root.into();
         if !root.is_dir() {
@@ -29,7 +39,11 @@ impl PosixBackend {
                 root.display()
             )));
         }
-        Ok(Self { id, root })
+        Ok(Self {
+            id,
+            root,
+            cost_per_gb_month,
+        })
     }
 
     fn full(&self, rel: &Path) -> PathBuf {
@@ -202,6 +216,10 @@ impl Backend for PosixBackend {
         )
         .map_err(|e| FsError::Io(std::io::Error::from(e)))?;
         Ok(())
+    }
+
+    fn cost_per_gb_month(&self) -> Option<f64> {
+        self.cost_per_gb_month
     }
 
     fn statvfs(&self) -> Result<BackendStats> {

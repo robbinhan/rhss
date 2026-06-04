@@ -55,7 +55,9 @@ impl CliContext {
         Ok(SqlitePathIndex::open(&cfg.db)? as Arc<dyn PathIndex>)
     }
 
-    /// Build a TierRouter from config. Does not touch the index.
+    /// Build a TierRouter from config. Does not touch the index. Honors
+    /// per-backend cost_per_gb_month (D26) so read-only commands like
+    /// `rhss cost` see the right values.
     pub fn build_router(&self) -> Result<(RhssConfig, Arc<TierRouter>)> {
         let cfg = self.load_config()?;
         let fast: Vec<Arc<dyn Backend>> = cfg
@@ -63,8 +65,11 @@ impl CliContext {
             .fast
             .iter()
             .map(|b| {
-                Ok(Arc::new(PosixBackend::new(b.id.clone(), b.root.clone())?)
-                    as Arc<dyn Backend>)
+                Ok(Arc::new(PosixBackend::with_cost(
+                    b.id.clone(),
+                    b.root.clone(),
+                    b.cost_per_gb_month,
+                )?) as Arc<dyn Backend>)
             })
             .collect::<Result<_>>()?;
         let slow: Vec<Arc<dyn Backend>> = cfg
@@ -72,8 +77,11 @@ impl CliContext {
             .slow
             .iter()
             .map(|b| {
-                Ok(Arc::new(PosixBackend::new(b.id.clone(), b.root.clone())?)
-                    as Arc<dyn Backend>)
+                Ok(Arc::new(PosixBackend::with_cost(
+                    b.id.clone(),
+                    b.root.clone(),
+                    b.cost_per_gb_month,
+                )?) as Arc<dyn Backend>)
             })
             .collect::<Result<_>>()?;
         let router = Arc::new(TierRouter::new(
