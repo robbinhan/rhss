@@ -21,7 +21,10 @@ use crate::index::{PathIndex, SqlitePathIndex, TierId};
 use crate::lock::StorageLock;
 use crate::policy::{PopularityPolicy, TieringPolicy};
 use crate::scan;
-use crate::tier::{MirrorPlacement, MostFreePlacement, Placement, RoundRobinPlacement, Tier, TierRouter};
+use crate::tier::{
+    CostAwarePlacement, MirrorPlacement, MostFreePlacement, Placement, RoundRobinPlacement, Tier,
+    TierRouter,
+};
 use crate::tierer::{OpenFileTracker, Tierer};
 use crate::{FuseAdapter, PosixBackend};
 
@@ -31,6 +34,7 @@ fn make_placement(pol: Option<&TierPolicy>) -> Result<Box<dyn Placement>> {
         "most_free" => Box::new(MostFreePlacement),
         "round_robin" => Box::new(RoundRobinPlacement::new()),
         "mirror" => Box::new(MirrorPlacement::new()),
+        "cost_aware" => Box::new(CostAwarePlacement::new()),
         other => return Err(FsError::Storage(format!("unknown placement: {other}"))),
     })
 }
@@ -83,21 +87,16 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
         std::process::exit(1);
     }
 
-    let make_backend = |id: &str, root: &std::path::Path| -> Arc<dyn Backend> {
-        Arc::new(PosixBackend::new(id, root.to_path_buf()).expect("backend init"))
+    let make_backend = |b: &crate::config::BackendConfig| -> Arc<dyn Backend> {
+        Arc::new(
+            PosixBackend::with_cost(b.id.clone(), b.root.clone(), b.cost_per_gb_month)
+                .expect("backend init"),
+        )
     };
-    let fast_backends: Vec<Arc<dyn Backend>> = cfg
-        .tier
-        .fast
-        .iter()
-        .map(|b| make_backend(&b.id, &b.root))
-        .collect();
-    let slow_backends: Vec<Arc<dyn Backend>> = cfg
-        .tier
-        .slow
-        .iter()
-        .map(|b| make_backend(&b.id, &b.root))
-        .collect();
+    let fast_backends: Vec<Arc<dyn Backend>> =
+        cfg.tier.fast.iter().map(make_backend).collect();
+    let slow_backends: Vec<Arc<dyn Backend>> =
+        cfg.tier.slow.iter().map(make_backend).collect();
 
     let fast_pl = match make_placement(cfg.tier.fast_policy.as_ref()) {
         Ok(p) => p,
@@ -160,6 +159,7 @@ pub fn run(ctx: &CliContext, args: MountArgs) -> Result<()> {
                 secret_key: sk,
                 staging_root: staging,
                 prefix: a.prefix.clone(),
+                cost_per_gb_month: a.cost_per_gb_month,
             }) {
                 Ok(b) => b as Arc<dyn Backend>,
                 Err(e) => {

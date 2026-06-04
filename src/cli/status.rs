@@ -89,6 +89,103 @@ pub fn backends(ctx: &CliContext) -> Result<()> {
     Ok(())
 }
 
+pub fn cost(ctx: &CliContext) -> Result<()> {
+    let (_cfg, router) = ctx.build_router()?;
+
+    // Per-backend rows: (tier, id, used_bytes, cost_per_gb_month, monthly).
+    struct Row {
+        tier: &'static str,
+        id: String,
+        used_bytes: u64,
+        cost_per_gb_month: Option<f64>,
+        monthly: Option<f64>,
+    }
+    let mut rows = Vec::<Row>::new();
+    for (tier_id, b) in router.all_backends() {
+        let used = b.statvfs().map(|s| s.used_bytes).unwrap_or(0);
+        let cost = b.cost_per_gb_month();
+        let monthly = cost.map(|c| (used as f64 / (1024.0 * 1024.0 * 1024.0)) * c);
+        let tier_name_str = match tier_id {
+            crate::index::TierId::Fast => "Fast",
+            crate::index::TierId::Slow => "Slow",
+            crate::index::TierId::Archive => "Archive",
+        };
+        rows.push(Row {
+            tier: tier_name_str,
+            id: b.id().to_string(),
+            used_bytes: used,
+            cost_per_gb_month: cost,
+            monthly,
+        });
+    }
+
+    if ctx.json {
+        #[derive(Serialize)]
+        struct CostJson {
+            backends: Vec<BackendCostJson>,
+            total_monthly: f64,
+        }
+        #[derive(Serialize)]
+        struct BackendCostJson {
+            tier: &'static str,
+            id: String,
+            used_bytes: u64,
+            cost_per_gb_month: Option<f64>,
+            monthly: Option<f64>,
+        }
+        let backends_json: Vec<BackendCostJson> = rows
+            .iter()
+            .map(|r| BackendCostJson {
+                tier: r.tier,
+                id: r.id.clone(),
+                used_bytes: r.used_bytes,
+                cost_per_gb_month: r.cost_per_gb_month,
+                monthly: r.monthly,
+            })
+            .collect();
+        let total: f64 = rows.iter().filter_map(|r| r.monthly).sum();
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&CostJson {
+                backends: backends_json,
+                total_monthly: total,
+            })?
+        );
+        return Ok(());
+    }
+
+    println!(
+        "{:<8}  {:<14}  {:>12}  {:>14}  {:>12}",
+        "TIER", "BACKEND", "USED", "$/GiB/mo", "MONTHLY"
+    );
+    for r in &rows {
+        let used = fmt_bytes(r.used_bytes);
+        let rate = r
+            .cost_per_gb_month
+            .map(|c| format!("${c:.4}"))
+            .unwrap_or_else(|| "—".into());
+        let monthly = r
+            .monthly
+            .map(|m| format!("${m:.2}"))
+            .unwrap_or_else(|| "—".into());
+        println!(
+            "{:<8}  {:<14}  {:>12}  {:>14}  {:>12}",
+            r.tier, r.id, used, rate, monthly
+        );
+    }
+    let total: f64 = rows.iter().filter_map(|r| r.monthly).sum();
+    let unpriced = rows.iter().filter(|r| r.cost_per_gb_month.is_none()).count();
+    println!();
+    if unpriced > 0 {
+        println!(
+            "(estimated total excludes {} backend(s) without declared cost)",
+            unpriced
+        );
+    }
+    println!("Estimated total: ${total:.2}/month");
+    Ok(())
+}
+
 pub fn stats(ctx: &CliContext) -> Result<()> {
     let (_cfg, router) = ctx.build_router()?;
     let index = ctx.open_index()?;

@@ -11,7 +11,9 @@ use crate::index::TierId;
 
 pub mod placement;
 
-pub use placement::{MirrorPlacement, MostFreePlacement, Placement, RoundRobinPlacement};
+pub use placement::{
+    CostAwarePlacement, MirrorPlacement, MostFreePlacement, Placement, RoundRobinPlacement,
+};
 
 /// One tier of storage. Owns its backends and the strategy that picks which
 /// backend a new file lands on.

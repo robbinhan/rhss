@@ -53,6 +53,7 @@ pub struct S3Backend {
     prefix: String,
     storage_class: String,
     staging_root: PathBuf,
+    cost_per_gb_month: Option<f64>,
     /// In-memory record of which files we've fetched (hot-list).
     cached: Mutex<std::collections::HashSet<PathBuf>>,
 }
@@ -67,6 +68,7 @@ pub struct S3Config {
     pub secret_key: String,
     pub staging_root: PathBuf,
     pub prefix: String,
+    pub cost_per_gb_month: Option<f64>,
 }
 
 impl S3Backend {
@@ -93,6 +95,7 @@ impl S3Backend {
             prefix: cfg.prefix,
             storage_class: cfg.storage_class,
             staging_root: cfg.staging_root,
+            cost_per_gb_month: cfg.cost_per_gb_month,
             cached: Mutex::new(Default::default()),
         }))
     }
@@ -192,6 +195,10 @@ impl Backend for S3Backend {
 
     fn resolve(&self, path: &Path) -> PathBuf {
         self.staging_path(path)
+    }
+
+    fn cost_per_gb_month(&self) -> Option<f64> {
+        self.cost_per_gb_month
     }
 
     fn read_at(&self, path: &Path, offset: u64, size: u32) -> Result<Vec<u8>> {
